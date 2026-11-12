@@ -3,11 +3,13 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_error.h>
 #include <mach/vm_map.h>
-#include <pthread.h>
 #include <pthread/qos.h>
+#endif
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +20,7 @@
 #include "mmu.h"
 #include "timer.h"
 
+#ifdef __APPLE__
 extern kern_return_t mach_memory_entry_ownership(mach_port_t entry, task_t owner, int ledger_tag, int ledger_flags);
 
 uint8_t *hv_alloc_no_footprint(uint64_t size) {
@@ -56,6 +59,12 @@ uint8_t *hv_alloc_no_footprint(uint64_t size) {
             (unsigned long long)(size >> 20));
     return (uint8_t *)base;
 }
+#else
+uint8_t *hv_alloc_no_footprint(uint64_t size) {
+    (void)size;
+    return NULL;
+}
+#endif
 
 struct PrefaultArgs {
     uint8_t *ram;
@@ -65,7 +74,9 @@ struct PrefaultArgs {
 static void *prefault_thread(void *arg) {
     struct PrefaultArgs a = *(struct PrefaultArgs *)arg;
     free(arg);
+#ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
     for (uint64_t off = 0; off < a.size; off += 0x1000)
         __atomic_fetch_add((volatile uint64_t *)(a.ram + off), 0, __ATOMIC_RELAXED);
     return NULL;
@@ -150,8 +161,16 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
             }
         }
     }
-    if (b->ram == MAP_FAILED)
+    if (b->ram == MAP_FAILED) {
+#ifdef MAP_NORESERVE
+        b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+#else
         b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+#endif
+#ifdef MADV_HUGEPAGE
+        if (b->ram != MAP_FAILED) madvise(b->ram, ram_size, MADV_HUGEPAGE);
+#endif
+    }
     if (b->ram == MAP_FAILED) return -1;
 
     /* 2. Build Flattened Device Tree (placed at 0x40000000 on every reset) */

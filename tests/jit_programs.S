@@ -3,11 +3,12 @@
 // (those come with the MMU tests), but SP is used as an ordinary operand.
 #include "harness.h"
 
+    .arch armv8.4-a
     .text
     .p2align 14
-    .globl _jit_programs_begin
-    .globl _jit_programs_finish
-_jit_programs_begin:
+    .globl SYM(jit_programs_begin)
+    .globl SYM(jit_programs_finish)
+SYM(jit_programs_begin):
 
 PROGRAM arith
     add x0, x1, x2
@@ -208,8 +209,13 @@ END stolen
 PROGRAM pcrel
     adr x0, .
     adr x1, pcrel_target
+#ifdef __APPLE__
     adrp x2, pcrel_target@PAGE
     adrp x18, pcrel_target@PAGE
+#else
+    adrp x2, pcrel_target
+    adrp x18, pcrel_target
+#endif
     adr x28, .
     sub x3, x1, x0
     b pcrel_target
@@ -266,4 +272,8 @@ PROGRAM pac
 END pac
 
     .p2align 14
-_jit_programs_finish:
+SYM(jit_programs_finish):
+
+#ifndef __APPLE__
+    .section .note.GNU-stack,"",@progbits
+#endif

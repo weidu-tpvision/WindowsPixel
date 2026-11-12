@@ -1,11 +1,19 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "winvm.h"
 
+#ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
 #include <TargetConditionals.h>
 #include <os/lock.h>
-#include <pthread.h>
 #include <pthread/qos.h>
+#include "audio_mac.h"
+#else
+#include <sched.h>
+#endif
+#include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -15,7 +23,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "audio_mac.h"
 #include "dispatch.h"
 #include "net_slirp.h"
 #include "share.h"
@@ -31,8 +38,13 @@ static int net_on;
 static int share_on;
 static _Atomic int stop_requested;
 
+#ifdef __APPLE__
 static os_unfair_lock display_lock = OS_UNFAIR_LOCK_INIT;
 static CFTypeRef display_layer;
+#else
+static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
+static void *display_layer;
+#endif
 static int display_layer_set;
 static _Atomic(HvFbDisplay *) display_fb;
 
@@ -64,7 +76,11 @@ static int fail(char *err, size_t n, const char *msg) {
 static struct sigaction prior_ill, prior_bus, prior_segv;
 static void on_ill(int sig, siginfo_t *info, void *ctx) {
     ucontext_t *uc = ctx;
+#ifdef __APPLE__
     uint64_t pc = uc->uc_mcontext->__ss.__pc;
+#else
+    uint64_t pc = uc->uc_mcontext.pc;
+#endif
     uint64_t rx = (uint64_t)(uintptr_t)m.jit.base;
     uint64_t size = (uint64_t)m.jit.capacity * 4;
     int in_rx = pc >= rx && pc < rx + size;
@@ -96,6 +112,7 @@ static void prepare_cpu_thread(void) {
     sigdelset(&set, SIGFPE);
     pthread_sigmask(SIG_BLOCK, &set, NULL);
 
+#ifdef __APPLE__
     const char *q = getenv("HV_QOS");
 #if TARGET_OS_IPHONE
     /* Schedule guest vCPUs on P-cores while staying strictly below UI (USER_INTERACTIVE) */
@@ -107,9 +124,20 @@ static void prepare_cpu_thread(void) {
     else if (q && !strcmp(q, "init")) c = QOS_CLASS_USER_INITIATED;
     else if (q && !strcmp(q, "default")) c = QOS_CLASS_DEFAULT;
     if (c != QOS_CLASS_DEFAULT) pthread_set_qos_class_self_np(c, 0);
+#elif defined(__ANDROID__)
+    /* On Tensor G4 (1x X4 + 3x A720 + 4x A520), keep vCPU threads off the in-order A520 efficiency cores (0..3). */
+    long nprocs = sysconf(_SC_NPROCESSORS_CONF);
+    if (nprocs >= 8 && !getenv("HV_NO_PIN")) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        for (int c = 4; c < nprocs && c < 8; c++) CPU_SET(c, &cpuset);
+        sched_setaffinity(0, sizeof(cpuset), &cpuset);
+    }
+#endif
 }
 
 void hv_winvm_set_display_layer(void *layer) {
+#ifdef __APPLE__
     CFTypeRef retained = layer ? CFRetain(layer) : NULL;
     os_unfair_lock_lock(&display_lock);
     CFTypeRef previous = display_layer;
@@ -119,6 +147,12 @@ void hv_winvm_set_display_layer(void *layer) {
     if (fb) hv_fb_metal_set_layer(fb, layer);
     os_unfair_lock_unlock(&display_lock);
     if (previous) CFRelease(previous);
+#else
+    pthread_mutex_lock(&display_lock);
+    display_layer = layer;
+    display_layer_set = 1;
+    pthread_mutex_unlock(&display_lock);
+#endif
 }
 
 int hv_winvm_display_size(uint32_t *w, uint32_t *h) {
@@ -134,7 +168,11 @@ int hv_winvm_display_size(uint32_t *w, uint32_t *h) {
 
 uint64_t hv_winvm_display_frames(void) {
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
+#ifdef __APPLE__
     return fb ? hv_fb_metal_frames(fb) : 0;
+#else
+    return (fb && fb->active) ? 1 : 0;
+#endif
 }
 
 int hv_winvm_save_png(const char *path) {
@@ -171,8 +209,8 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
     if (r != 0) return fail(err, errlen, "Cannot initialize ARM64 JIT region (is JIT active?).");
 
-#if TARGET_OS_IPHONE
-    /* Defer synchronous guest NVMe FLUSH fsyncs on iOS APFS NAND; explicit host checkpoints call hv_disk_sync(). */
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
+    /* Defer synchronous guest NVMe FLUSH fsyncs on mobile flash; explicit host checkpoints call hv_disk_sync(). */
     if (!getenv("HV_FLUSH")) hv_knob[HV_K_FLUSH] = 1;
 #endif
 
@@ -201,13 +239,21 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
         if (hv_net_attach(&m, board.net) == 0) net_on = 1;
         else fprintf(stderr, "winvm: user-mode SLIRP networking unavailable\n");
     }
+#ifdef __APPLE__
     if (board.hda && c->enable_sound) hv_audio_attach_hda(board.hda);
+#endif
     board.poll = board_poll;
 
+#ifdef __APPLE__
     os_unfair_lock_lock(&display_lock);
     if (display_layer_set && board.fb) hv_fb_metal_set_layer(board.fb, (void *)display_layer);
     atomic_store_explicit(&display_fb, board.fb, memory_order_release);
     os_unfair_lock_unlock(&display_lock);
+#else
+    pthread_mutex_lock(&display_lock);
+    atomic_store_explicit(&display_fb, board.fb, memory_order_release);
+    pthread_mutex_unlock(&display_lock);
+#endif
 
     return 0;
 }
@@ -215,7 +261,7 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
 static void *kicker_thread(void *unused) {
     (void)unused;
     while (!atomic_load_explicit(&stop_requested, memory_order_relaxed)) {
-#if TARGET_OS_IPHONE
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
         usleep(2500);
 #else
         usleep(1000);
@@ -336,7 +382,9 @@ void hv_winvm_start(int spawn_cpu0, void (*on_exit)(int reason)) {
 
 void hv_winvm_stop(void) {
     atomic_store(&stop_requested, 1);
+#ifdef __APPLE__
     hv_audio_shutdown();
+#endif
     for (int i = 0; i < ncpus; i++) cpus[i].halted = 3;
     hv_machine_kick_all(&m);
     for (int i = 0; i < ncpus; i++) hv_cpu_wake(&cpus[i]);

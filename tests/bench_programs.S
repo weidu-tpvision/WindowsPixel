@@ -4,9 +4,9 @@
 
     .text
     .p2align 14
-    .globl _bench_programs_begin
-    .globl _bench_programs_finish
-_bench_programs_begin:
+    .globl SYM(bench_programs_begin)
+    .globl SYM(bench_programs_finish)
+SYM(bench_programs_begin):
 
 // Calls with frames: fib(24) recursively, the way compiled code does it.
 PROGRAM bench_calls
@@ -82,4 +82,8 @@ PROGRAM bench_loop
 END bench_loop
 
     .p2align 14 /* whole pages, or the TLB will not map the last one */
-_bench_programs_finish:
+SYM(bench_programs_finish):
+
+#ifndef __APPLE__
+.section .note.GNU-stack,"",@progbits
+#endif

@@ -11,20 +11,24 @@
 #include "share.h"
 #include "net_slirp.h"
 
+#ifdef __APPLE__
 #include <TargetConditionals.h>
 #include <copyfile.h>
+#include <removefile.h>
+#include <sys/mount.h>
+#else
+#include <sys/vfs.h>
+#endif
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
-#include <removefile.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -55,7 +59,7 @@ static time_t agent_seen;
 
 static int is_url_handler_on(void) {
     if (url_handler_enabled < 0) {
-#if TARGET_OS_IPHONE
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
         url_handler_enabled = 1;
 #else
         url_handler_enabled = getenv("HV_OAUTH_BRIDGE") != NULL ? 1 : 0;
@@ -365,9 +369,15 @@ static void add_entry(Text *t, const char *url_path, const char *name, const str
     int dir = S_ISDIR(st->st_mode);
     char modified[64], created[64];
     struct tm tm;
-    gmtime_r(&st->st_mtimespec.tv_sec, &tm);
+    time_t mtime_sec = st->st_mtime;
+#ifdef __APPLE__
+    time_t btime_sec = st->st_birthtimespec.tv_sec;
+#else
+    time_t btime_sec = st->st_ctime;
+#endif
+    gmtime_r(&mtime_sec, &tm);
     strftime(modified, sizeof modified, "%a, %d %b %Y %H:%M:%S GMT", &tm);
-    gmtime_r(&st->st_birthtimespec.tv_sec, &tm);
+    gmtime_r(&btime_sec, &tm);
     strftime(created, sizeof created, "%Y-%m-%dT%H:%M:%SZ", &tm);
     adds(t, "<D:response><D:href>");
     add_url(t, url_path);
@@ -380,7 +390,7 @@ static void add_entry(Text *t, const char *url_path, const char *name, const str
     } else {
         addf(t, "<D:resourcetype/><D:getcontentlength>%lld</D:getcontentlength><D:getcontenttype>application/octet-stream</D:getcontenttype>"
                 "<D:getetag>\"%llx-%llx\"</D:getetag>",
-             (long long)st->st_size, (unsigned long long)st->st_size, (unsigned long long)st->st_mtimespec.tv_sec);
+             (long long)st->st_size, (unsigned long long)st->st_size, (unsigned long long)mtime_sec);
     }
     adds(t, "<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>"
             "<D:lockdiscovery/>");
@@ -469,14 +479,15 @@ static int do_get(Conn *c, Request *r) {
     long long len = st.st_size ? to - from + 1 : 0;
     char modified[64];
     struct tm tm;
-    gmtime_r(&st.st_mtimespec.tv_sec, &tm);
+    time_t mtime_sec = st.st_mtime;
+    gmtime_r(&mtime_sec, &tm);
     strftime(modified, sizeof modified, "%a, %d %b %Y %H:%M:%S GMT", &tm);
     char head[1024];
     int n = snprintf(head, sizeof head,
                      "HTTP/1.1 %s\r\nServer: Henge\r\nContent-Length: %lld\r\nContent-Type: application/octet-stream\r\nAccept-Ranges: bytes\r\n"
                      "Last-Modified: %s\r\nETag: \"%llx-%llx\"\r\n",
                      partial ? "206 Partial Content" : "200 OK", len, modified, (unsigned long long)st.st_size,
-                     (unsigned long long)st.st_mtimespec.tv_sec);
+                     (unsigned long long)mtime_sec);
     if (partial) n += snprintf(head + n, sizeof head - (size_t)n, "Content-Range: bytes %lld-%lld/%lld\r\n", from, to, (long long)st.st_size);
     n += snprintf(head + n, sizeof head - (size_t)n, "%s\r\n", r->close ? "Connection: close\r\n" : "");
     int rc = send_all(c->fd, head, (size_t)n);
@@ -561,9 +572,83 @@ static int do_put(Conn *c, Request *r) {
 static int remove_path(const char *local) {
     struct stat st;
     if (lstat(local, &st) != 0) return -1;
+#ifdef __APPLE__
     if (S_ISDIR(st.st_mode)) return removefile(local, NULL, REMOVEFILE_RECURSIVE);
     return unlink(local);
+#else
+    if (!S_ISDIR(st.st_mode)) return unlink(local);
+    DIR *d = opendir(local);
+    if (!d) return -1;
+    struct dirent *e;
+    int rc = 0;
+    while ((e = readdir(d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char child[PATH_MAX];
+        if (snprintf(child, sizeof child, "%s/%s", local, e->d_name) >= (int)sizeof child || remove_path(child) != 0) {
+            rc = -1;
+        }
+    }
+    closedir(d);
+    if (rc == 0 && rmdir(local) != 0) rc = -1;
+    return rc;
+#endif
 }
+
+#ifndef __APPLE__
+static int copy_path_recursive(const char *from, const char *to) {
+    struct stat st;
+    if (lstat(from, &st) != 0) return -1;
+    if (S_ISDIR(st.st_mode)) {
+        if (mkdir(to, st.st_mode & 0777) != 0 && errno != EEXIST) return -1;
+        DIR *d = opendir(from);
+        if (!d) return -1;
+        struct dirent *e;
+        int rc = 0;
+        while ((e = readdir(d)) != NULL) {
+            if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            char cfrom[PATH_MAX], cto[PATH_MAX];
+            if (snprintf(cfrom, sizeof cfrom, "%s/%s", from, e->d_name) >= (int)sizeof cfrom ||
+                snprintf(cto, sizeof cto, "%s/%s", to, e->d_name) >= (int)sizeof cto ||
+                copy_path_recursive(cfrom, cto) != 0) {
+                rc = -1;
+                break;
+            }
+        }
+        closedir(d);
+        return rc;
+    }
+    int in_fd = open(from, O_RDONLY | O_NOFOLLOW);
+    if (in_fd < 0) return -1;
+    int out_fd = open(to, O_CREAT | O_TRUNC | O_WRONLY, st.st_mode & 0777);
+    if (out_fd < 0) {
+        close(in_fd);
+        return -1;
+    }
+    char buf[65536];
+    int rc = 0;
+    for (;;) {
+        ssize_t r = read(in_fd, buf, sizeof buf);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) {
+            if (r < 0) rc = -1;
+            break;
+        }
+        for (ssize_t done = 0; done < r;) {
+            ssize_t w = write(out_fd, buf + done, (size_t)(r - done));
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) {
+                rc = -1;
+                break;
+            }
+            done += w;
+        }
+        if (rc != 0) break;
+    }
+    close(out_fd);
+    close(in_fd);
+    return rc;
+}
+#endif
 
 static int do_delete(Conn *c, Request *r) {
     if (body_discard(c, r) != 0) return -1;
@@ -594,7 +679,11 @@ static int do_move_copy(Conn *c, Request *r, int move) {
     int existed = stat(to, &st) == 0;
     if (existed && !r->overwrite) return respond_empty(c, r, 412, "Precondition Failed");
     if (existed && strcmp(from, to) != 0 && remove_path(to) != 0) return respond_empty(c, r, 403, "Forbidden");
+#ifdef __APPLE__
     int rc = move ? rename(from, to) : copyfile(from, to, NULL, COPYFILE_ALL | COPYFILE_RECURSIVE);
+#else
+    int rc = move ? rename(from, to) : copy_path_recursive(from, to);
+#endif
     if (rc != 0) return errno == ENOENT ? respond_empty(c, r, 409, "Conflict") : respond_empty(c, r, 403, "Forbidden");
     return existed ? respond_empty(c, r, 204, "No Content") : respond_empty(c, r, 201, "Created");
 }
@@ -926,8 +1015,10 @@ static void *listener(void *arg) {
             usleep(100000);
             continue;
         }
+#ifdef SO_NOSIGPIPE
         int on = 1;
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+#endif
         Conn *c = calloc(1, sizeof *c);
         c->fd = fd;
         pthread_t t;

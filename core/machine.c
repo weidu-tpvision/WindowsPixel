@@ -1,6 +1,5 @@
 #include "machine.h"
 
-#include <mach/mach_time.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,11 +107,11 @@ __thread HvCpu *hv_self;
 
 void hv_dev_lock(HvMachine *m) {
     if (pthread_mutex_trylock(&m->dev_mu) == 0) return;
-    uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
+    uint64_t t0 = m->stats_interval ? hv_counter() : 0;
     pthread_mutex_lock(&m->dev_mu);
     if (m->stats_interval) {
         m->stats.dev_waits++;
-        m->stats.dev_wait_ticks += mach_absolute_time() - t0;
+        m->stats.dev_wait_ticks += hv_counter() - t0;
     }
 }
 
@@ -176,7 +175,7 @@ void hv_cpu_process_requests(HvCpu *cpu) {
 void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
     HvPerCpu *t = target->pc_state, *s = self ? self->pc_state : NULL;
     HvMachine *mm = target->m;
-    uint64_t t0 = mm->stats_interval ? mach_absolute_time() : 0;
+    uint64_t t0 = mm->stats_interval ? hv_counter() : 0;
     if (s) __atomic_store_n(&s->tlb_live, 0, __ATOMIC_SEQ_CST); /* others need not wait for this one meanwhile */
     for (uint32_t spins = 0;; spins++) {
         if (__atomic_load_n(&t->ack_seq, __ATOMIC_ACQUIRE) >= seq) break;
@@ -190,7 +189,7 @@ void hv_cpu_sync(HvCpu *self, HvCpu *target, uint64_t seq) {
     }
     if (mm->stats_interval) {
         mm->stats.syncs++;
-        mm->stats.sync_ticks += mach_absolute_time() - t0;
+        mm->stats.sync_ticks += hv_counter() - t0;
     }
 }
 

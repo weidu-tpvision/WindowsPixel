@@ -1,7 +1,9 @@
 #ifndef HENGEVM_MACHINE_H
 #define HENGEVM_MACHINE_H
 
+#ifdef __APPLE__
 #include <TargetConditionals.h>
+#endif
 #include <pthread.h>
 #include <stdint.h>
 
@@ -107,7 +109,7 @@ typedef struct HvStats {
     uint64_t wfi, wfi_ticks;  /* WFI exits, host ticks spent asleep */
 } HvStats;
 
-#if TARGET_OS_IPHONE
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
 #define HV_MAX_CPUS 4
 #else
 #define HV_MAX_CPUS 8

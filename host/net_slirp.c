@@ -10,6 +10,8 @@
 #include "net_slirp.h"
 #include "share.h"
 
+#if defined(__APPLE__) || defined(HAVE_SLIRP)
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -260,6 +262,11 @@ static void timer_mod(void *timer, int64_t expire_ms, void *opaque) {
     if (timer) ((Timer *)timer)->expire_ms = expire_ms;
 }
 
+#if defined(SLIRP_CONFIG_VERSION_MAX) && SLIRP_CONFIG_VERSION_MAX < 6
+typedef int slirp_os_socket;
+#define slirp_pollfds_fill_socket slirp_pollfds_fill
+#endif
+
 static void register_poll_socket(slirp_os_socket fd, void *opaque) {
     (void)fd, (void)opaque;
 }
@@ -305,8 +312,13 @@ static const SlirpCb callbacks = {
     .timer_mod = timer_mod,
     .notify = notify,
     .timer_new_opaque = timer_new_opaque,
+#if defined(SLIRP_CONFIG_VERSION_MAX) && SLIRP_CONFIG_VERSION_MAX < 6
+    .register_poll_fd = register_poll_socket,
+    .unregister_poll_fd = unregister_poll_socket,
+#else
     .register_poll_socket = register_poll_socket,
     .unregister_poll_socket = unregister_poll_socket,
+#endif
 };
 
 /* ---- the network thread ---- */
@@ -408,7 +420,11 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     fcntl(wake_pipe[1], F_SETFL, O_NONBLOCK);
     SlirpConfig cfg;
     memset(&cfg, 0, sizeof cfg);
+#if defined(SLIRP_CONFIG_VERSION_MAX) && SLIRP_CONFIG_VERSION_MAX < 6
+    cfg.version = SLIRP_CONFIG_VERSION_MAX;
+#else
     cfg.version = 6; /* below 6 it calls the old register_poll_fd, which we leave unset */
+#endif
     cfg.in_enabled = true;
     inet_pton(AF_INET, "10.0.2.0", &cfg.vnetwork);
     inet_pton(AF_INET, "255.255.255.0", &cfg.vnetmask);
@@ -440,3 +456,14 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     pthread_create(&t, NULL, net_thread, NULL);
     return 0;
 }
+
+#else /* !(defined(__APPLE__) || defined(HAVE_SLIRP)) */
+
+uint64_t hv_net_tx_frames, hv_net_rx_frames;
+
+void hv_net_set_share_socket(const char *path) { (void)path; }
+int hv_net_attach(HvMachine *m, HvVirtioNet *n) { (void)m; (void)n; return -1; }
+void hv_net_poll(void) {}
+void hv_net_add_hostfwd(int host_port, int guest_port) { (void)host_port; (void)guest_port; }
+
+#endif

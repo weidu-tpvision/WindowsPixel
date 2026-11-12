@@ -1,6 +1,8 @@
 #include "sysreg.h"
 
+#ifdef __APPLE__
 #include <mach/mach_time.h>
+#endif
 #include <stdio.h>
 #include <string.h>
 
@@ -26,8 +28,35 @@
 #define CLIDR        0x0a200023ull         /* L1 split, L2 unified */
 #define CNTFRQ       24000000ull
 
+#ifndef __APPLE__
+uint64_t hv_cnt_base;
+uint64_t hv_cnt_mult;
+
+void hv_counter_ensure_init(void) {
+    if (__atomic_load_n(&hv_cnt_mult, __ATOMIC_ACQUIRE)) return;
+    uint64_t frq = 0, vct = 0;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(vct));
+    if (!frq) frq = CNTFRQ;
+    uint64_t mult = (uint64_t)((((__uint128_t)CNTFRQ << 60) + (frq >> 1)) / frq);
+    hv_cnt_base = vct;
+    __atomic_store_n(&hv_cnt_mult, mult, __ATOMIC_RELEASE);
+}
+
+__attribute__((constructor)) static void hv_counter_ctor(void) {
+    hv_counter_ensure_init();
+}
+#endif
+
 static uint64_t counter(void) {
+#ifdef __APPLE__
     return mach_absolute_time(); /* 24 MHz on Apple silicon */
+#else
+    if (!hv_cnt_mult) hv_counter_ensure_init();
+    uint64_t vct;
+    __asm__ volatile("isb; mrs %0, cntvct_el0" : "=r"(vct));
+    return (uint64_t)(((__uint128_t)(vct - hv_cnt_base) * hv_cnt_mult) >> 60);
+#endif
 }
 
 uint64_t hv_counter(void) {

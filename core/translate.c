@@ -7,6 +7,7 @@
 #include "memop.h"
 #include "mmu.h"
 #include "operands.h"
+#include "sysreg.h"
 
 /* A block has two parts. The hot part is the code that runs every time: the translated
    instructions. The cold part is what hardly ever does: exits not chained yet, memory slow
@@ -1515,9 +1516,13 @@ static int translate_msr_inline(Emit *e, uint32_t insn, uint64_t pc) {
 #define COMMPAGE_TIMEBASE_OFFSET 0xfffffc088ull
 #define COMMPAGE_TIMEBASE_TYPE   0xfffffc090ull
 static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical) {
+#ifdef __APPLE__
     static int type = -1;
     if (type < 0) type = *(volatile uint8_t *)(uintptr_t)COMMPAGE_TIMEBASE_TYPE;
     if (type == 0) return 0; /* the kernel's own path: leave it to the helper */
+#else
+    if (!hv_cnt_mult) hv_counter_ensure_init();
+#endif
     int rt = insn & 0x1f;
     if (rt == 31) return 1;
     if (!(e->flags & HV_BLOCK_EL1)) {
@@ -1528,11 +1533,24 @@ static int translate_counter(Emit *e, uint32_t insn, uint64_t pc, int physical) 
     uint32_t slow = e->nool - 1;
     int el0 = !(e->flags & HV_BLOCK_EL1);
     int r = is_stolen(rt) ? 15 : rt;
+#ifdef __APPLE__
     if (type == 1) put(e, 0xd5033fdfu);                                  /* isb; then CNTVCT_EL0 */
     put(e, (type == 1 ? 0xd53be040u : type == 2 ? 0xd53be0c0u : 0xd53cfac0u) | (uint32_t)r);
     put_lit(e, 6, COMMPAGE_TIMEBASE_OFFSET);
     put(e, LDR_X(6, 6, 0));
     put(e, ADD_LSL(r, r, 6, 0));
+#else
+    put(e, 0xd5033fdfu);                                                 /* isb */
+    put(e, 0xd53be040u | (uint32_t)r);                                   /* mrs xr, cntvct_el0 */
+    put_lit(e, 6, hv_cnt_base);
+    put(e, SUB_X(r, r, 6));                                              /* sub xr, xr, x6 */
+    if (hv_cnt_mult != (1ull << 60)) {
+        put_lit(e, 6, hv_cnt_mult);
+        put(e, 0x9b067c00u | (uint32_t)r << 5 | 7u);                     /* mul x7, xr, x6 */
+        put(e, 0x9bc67c00u | (uint32_t)r << 5 | (uint32_t)r);            /* umulh xr, xr, x6 */
+        put(e, 0x93c7f000u | (uint32_t)r << 5 | (uint32_t)r);            /* extr xr, xr, x7, #60 */
+    }
+#endif
     if (r != rt) put(e, STR_X(r, 28, slot_of(rt)));
     if (el0) e->ool[slow].join = e->n;
     return 1;
@@ -1556,6 +1574,15 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
         if (rt == 31) return 1;
         int r = is_stolen(rt) ? 15 : rt;
         put(e, 0xd53be040u | (uint32_t)r);                        /* mrs xr, cntvct_el0 */
+#ifndef __APPLE__
+        if (!hv_cnt_mult) hv_counter_ensure_init();
+        if (hv_cnt_mult != (1ull << 60)) {
+            put_lit(e, 6, hv_cnt_mult);
+            put(e, 0x9b067c00u | (uint32_t)r << 5 | 7u);          /* mul x7, xr, x6 */
+            put(e, 0x9bc67c00u | (uint32_t)r << 5 | (uint32_t)r); /* umulh xr, xr, x6 */
+            put(e, 0x93c7f000u | (uint32_t)r << 5 | (uint32_t)r); /* extr xr, xr, x7, #60 */
+        }
+#endif
         put(e, 0xd379e000u | (uint32_t)r << 5 | (uint32_t)r);     /* lsl xr, xr, #7 (~3.072 GHz) */
         if (r != rt) put(e, STR_X(r, 28, slot_of(rt)));
         return 1;

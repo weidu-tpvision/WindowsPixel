@@ -52,12 +52,16 @@ int hv_disk_write(HvDisk *d, uint64_t off, const void *buf, uint64_t len) {
 }
 
 /* HV_FLUSH: 0 fsync; 1 nothing here, what was written is safe in the host's cache as long as the
-   host runs; 2 fcntl(F_BARRIERFSYNC). */
+   host runs; 2 fcntl(F_BARRIERFSYNC) on Darwin / fdatasync on Linux/Android. */
 int hv_disk_flush(HvDisk *d) {
     if (d->readonly) return 0;
     switch (hv_knob[HV_K_FLUSH]) {
     case 1: return 0;
+#ifdef __APPLE__
     case 2: return fcntl(d->fd, F_BARRIERFSYNC) == -1 ? -1 : 0;
+#else
+    case 2: return fdatasync(d->fd);
+#endif
     default: return fsync(d->fd);
     }
 }

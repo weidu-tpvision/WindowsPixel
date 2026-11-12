@@ -1,10 +1,14 @@
 // Pairs of words: an instruction, then the hv_gpr_fields mask it should give.
 // RD=1 RN=2 RM=4 RA=8 RD_SP=16 RN_SP=32
+    .arch armv8.4-a
     .text
     .p2align 2
     .globl _hv_operand_cases
+    .globl hv_operand_cases
     .globl _hv_operand_cases_end
+    .globl hv_operand_cases_end
 _hv_operand_cases:
+hv_operand_cases:
     add x0, sp, #16
     .word 1|2|16|32
     adds x0, sp, #16
@@ -79,3 +83,4 @@ _hv_operand_cases:
     setf8 w28
     .word 2
 _hv_operand_cases_end:
+hv_operand_cases_end:

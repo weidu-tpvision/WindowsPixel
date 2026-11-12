@@ -1,7 +1,11 @@
 /* Native vs JIT timing for typical code shapes (see bench_programs.S). */
 #include "harness.h"
 
+#ifdef __APPLE__
 #include <mach/mach_time.h>
+#else
+#include <time.h>
+#endif
 
 #include "translate.h"
 #include <stdlib.h>
@@ -23,9 +27,15 @@ static void at_el0(HvCpu *cpu) {
 }
 
 static double now_ms(void) {
+#ifdef __APPLE__
     static mach_timebase_info_data_t tb;
     if (!tb.denom) mach_timebase_info(&tb);
     return (double)mach_absolute_time() * tb.numer / tb.denom / 1e6;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+#endif
 }
 
 int main(void) {

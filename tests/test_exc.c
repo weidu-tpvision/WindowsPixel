@@ -1,6 +1,10 @@
 #include "harness.h"
 
+#ifdef __APPLE__
 #include <mach/mach_time.h>
+#else
+#include "sysreg.h"
+#endif
 #include <stdlib.h>
 
 DECLARE_PROGRAM(p_svc);
@@ -121,9 +125,15 @@ int main(void) {
         check("sysregs", "CNTV_CVAL", c.x[21], 0x123);
         check("sysregs", "CNTV_CTL ISTATUS", c.x[23], 5);
     }
+#ifdef __APPLE__
     mach_timebase_info_data_t tb;
     mach_timebase_info(&tb);
     check("host", "mach_absolute_time is 24 MHz (timebase 125/3)", (uint64_t)tb.numer * 1000 + tb.denom, 125003);
+#else
+    /* Verify that our inline JIT CNTVCT scaling (c.x[9]) matches hv_counter() at 24 MHz */
+    uint64_t hc = hv_counter();
+    check("host", "hv_counter matches JIT cntvct_el0 within 24 MHz window", hc >= c.x[9] && (hc - c.x[9]) < 2400000, 1);
+#endif
 
     static const TestProgram irq = TEST_PROGRAM(p_irq);
     m.percpu[0].irq_line = 1;

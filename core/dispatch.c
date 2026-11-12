@@ -1,12 +1,18 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "dispatch.h"
 
+#ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#endif
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "exception.h"
@@ -148,10 +154,10 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     }
     /* Translate without the lock, into this thread's buffer... */
     HvBlock nb = {.va = va, .pa = pa, .flags = flags, .gen = gen, .ram = ram, .pg = pg, .maker = cpu->index + 1, .jit_gen = __atomic_load_n(&m->jit_gen, __ATOMIC_SEQ_CST)};
-    uint64_t t0 = m->stats_interval ? mach_absolute_time() : 0;
+    uint64_t t0 = m->stats_interval ? hv_counter() : 0;
     if (hv_translate_emit(m, &nb, code, avail) != 0) goto flush_unlocked;
     if (m->stats_interval) {
-        m->stats.translate_ticks += mach_absolute_time() - t0;
+        m->stats.translate_ticks += hv_counter() - t0;
         m->stats.translated_insns += nb.ninsns;
     }
     /* ...and place it in the region (space is reserved atomically, so no lock either)... */
@@ -166,11 +172,11 @@ static HvBlock *lookup(HvCpu *cpu, uint64_t va, uint64_t pa, uint32_t flags, con
     block_dump(&nb, code);
     /* ...then take the lock only to publish it. */
     if (pthread_mutex_trylock(&m->tr_mu) != 0) {
-        uint64_t w0 = m->stats_interval ? mach_absolute_time() : 0;
+        uint64_t w0 = m->stats_interval ? hv_counter() : 0;
         pthread_mutex_lock(&m->tr_mu);
         if (m->stats_interval) {
             m->stats.tr_waits++;
-            m->stats.tr_wait_ticks += mach_absolute_time() - w0;
+            m->stats.tr_wait_ticks += hv_counter() - w0;
         }
     }
     b = find(m, h, va, pa, flags, gen); /* another CPU may have just made it: ours is dropped (its space stays used until a flush) */
@@ -244,11 +250,11 @@ static uint32_t wfe(HvCpu *cpu) {
     static int sleep_ok = -1;
     if (sleep_ok < 0) {
         __asm__ volatile("sevl; wfe" ::: "memory"); /* clear the event register */
-        uint64_t t0 = mach_absolute_time();
+        uint64_t t0 = hv_counter();
         __asm__ volatile("wfe" ::: "memory");
-        sleep_ok = mach_absolute_time() - t0 < 24 * 20;
+        sleep_ok = hv_counter() - t0 < 24 * 20;
     }
-    uint64_t deadline = mach_absolute_time() + 24 * 50; /* 50 us at 24 MHz */
+    uint64_t deadline = hv_counter() + 24 * 50; /* 50 us at 24 MHz */
     if (cpu->m->stats_interval) cpu->m->stats.wfe_waits++;
     for (;;) {
         uint64_t v;
@@ -259,7 +265,7 @@ static uint32_t wfe(HvCpu *cpu) {
         default: __asm__ volatile("ldaxr %0, [%1]" : "=r"(v) : "r"(host) : "memory"); break;
         }
         if (v != want || __atomic_load_n(&cpu->exit_req, __ATOMIC_RELAXED)) break;
-        if (mach_absolute_time() >= deadline) {
+        if (hv_counter() >= deadline) {
             __atomic_store_n(&cpu->exit_req, 1, __ATOMIC_RELAXED);
             break;
         }
@@ -286,7 +292,7 @@ static void *fast_resume(HvCpu *cpu) {
         return NULL;
     }
     if ((p->irq_line && !(cpu->daif & HV_PSTATE_I)) || (p->fiq_line && !(cpu->daif & HV_PSTATE_F))) { if (m->stats_interval) m->stats.fr_fail[2]++; return NULL; }
-    if (cpu->timer_due && mach_absolute_time() >= cpu->timer_due) { if (m->stats_interval) m->stats.fr_fail[3]++; return NULL; }
+    if (cpu->timer_due && hv_counter() >= cpu->timer_due) { if (m->stats_interval) m->stats.fr_fail[3]++; return NULL; }
     uint32_t flags = block_flags(cpu);
     int kernel = flags & HV_BLOCK_EL1;
     uint64_t va = cpu->pc;
@@ -455,10 +461,10 @@ static int wait_for_interrupt(HvCpu *cpu) {
     HvPerCpu *p = cpu->pc_state;
     if (p->irq_line || p->fiq_line) return 0;
     if (!m->tick) return -1; /* nothing could ever wake us */
-    uint64_t now = mach_absolute_time();
+    uint64_t now = hv_counter();
     uint64_t wait_ticks = deadline && deadline > now ? deadline - now : 240000; /* the counter runs at 24 MHz */
     if (wait_ticks > 240000) wait_ticks = 240000;
-    uint64_t t0 = mach_absolute_time();
+    uint64_t t0 = hv_counter();
     /* Sleep until the next timer event or until a device thread has work for us. */
     hv_big_unlock(m); /* let the other CPUs run while this one sleeps */
     park(cpu);
@@ -470,15 +476,15 @@ static int wait_for_interrupt(HvCpu *cpu) {
         static int sleep_ok = -1; /* does the host's WFE come back soon by itself? (see wfe()) */
         if (sleep_ok < 0) {
             __asm__ volatile("sevl; wfe" ::: "memory");
-            uint64_t t = mach_absolute_time();
+            uint64_t t = hv_counter();
             __asm__ volatile("wfe" ::: "memory");
-            sleep_ok = mach_absolute_time() - t < 24 * 20;
+            sleep_ok = hv_counter() - t < 24 * 20;
         }
-        uint64_t until = mach_absolute_time() + (uint64_t)spin_us * 24;
+        uint64_t until = hv_counter() + (uint64_t)spin_us * 24;
         for (;;) {
             uint32_t v;
             __asm__ volatile("ldaxr %w0, [%1]" : "=r"(v) : "r"(&p->wake_pending) : "memory"); /* a store to it wakes the WFE */
-            if (v || mach_absolute_time() >= until) break;
+            if (v || hv_counter() >= until) break;
             if (sleep_ok) __asm__ volatile("wfe" ::: "memory");
             else __asm__ volatile("yield" ::: "memory");
         }
@@ -486,15 +492,28 @@ static int wait_for_interrupt(HvCpu *cpu) {
     }
     pthread_mutex_lock(&p->wake_mu);
     if (!p->wake_pending) {
+#ifdef __APPLE__
         struct timespec ts = {(time_t)(wait_ticks / 24000000), (long)(wait_ticks % 24000000) * 1000 / 24};
         pthread_cond_timedwait_relative_np(&p->wake_cv, &p->wake_mu, &ts);
+#else
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t add_ns = (wait_ticks % 24000000ull) * 1000ull / 24ull;
+        ts.tv_sec += (time_t)(wait_ticks / 24000000ull);
+        ts.tv_nsec += (long)add_ns;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&p->wake_cv, &p->wake_mu, &ts);
+#endif
     }
     p->wake_pending = 0;
     pthread_mutex_unlock(&p->wake_mu);
     unpark(cpu);
     hv_big_lock(m);
     m->stats.wfi++;
-    m->stats.wfi_ticks += mach_absolute_time() - t0;
+    m->stats.wfi_ticks += hv_counter() - t0;
     m->tick(m, cpu);
     return 0;
 }
@@ -589,7 +608,7 @@ static void print_stats(HvCpu *cpu, int force) {
     __asm__ volatile("msr fpcr, %0" ::"r"(zero));
     static HvStats last;
     HvMachine *m = cpu->m;
-    uint64_t now = mach_absolute_time();
+    uint64_t now = hv_counter();
     if (!start_t) start_t = last_t = now;
     if (!force && now - last_t < (uint64_t)m->stats_interval * 24000000ull) {
         hv_fp_enter(cpu);
@@ -612,6 +631,7 @@ static void print_stats(HvCpu *cpu, int force) {
         for (int k = 0; k < 6; k++) tot += RATE(why[k]);
         /* How much of the interval the CPU thread actually ran: below 100% means the host took it away. */
         static double last_busy;
+#ifdef __APPLE__
         thread_basic_info_data_t ti;
         mach_msg_type_number_t cnt = THREAD_BASIC_INFO_COUNT;
         mach_port_t self = mach_thread_self();
@@ -630,6 +650,22 @@ static void print_stats(HvCpu *cpu, int force) {
             last_busy = busy;
         }
         mach_port_deallocate(mach_task_self(), self);
+#else
+        struct timespec ts_cpu;
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_cpu) == 0) {
+            double busy = (double)ts_cpu.tv_sec + (double)ts_cpu.tv_nsec / 1e9;
+            fprintf(stderr, "  cpu thread ran %.0f%% of the interval\n", 100 * (busy - last_busy) / dt);
+            if (m->ncpus > 1) {
+                fprintf(stderr, "  cpus:");
+                for (int i = 0; i < m->ncpus; i++)
+                    if (m->cpus[i])
+                        fprintf(stderr, " [%d] %s el%u pc %llx", i, m->cpus[i]->off ? "off" : "on", m->cpus[i]->el,
+                                (unsigned long long)m->cpus[i]->pc);
+                fprintf(stderr, "\n");
+            }
+            last_busy = busy;
+        }
+#endif
         fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                 RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
         { /* block hash health: chain lengths and how much of it is stale */
@@ -933,7 +969,7 @@ static int run_loop(HvCpu *cpu, int one) {
         /* Ticks take the device lock, so not every few blocks: on a kick (the 1 ms
            kicker, a device with work for CPU 0, an interrupt raised for this
            CPU) or once this CPU's own timer is due. */
-        if (m->tick && (kicked || (++since_tick >= 64 && (since_tick = 0, next_due && mach_absolute_time() >= next_due)))) {
+        if (m->tick && (kicked || (++since_tick >= 64 && (since_tick = 0, next_due && hv_counter() >= next_due)))) {
             since_tick = 0;
             next_due = m->tick(m, cpu);
             cpu->timer_due = next_due;

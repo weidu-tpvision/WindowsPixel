@@ -1,8 +1,13 @@
 #include "jit_region.h"
 
+#ifdef __APPLE__
 #include <TargetConditionals.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
+#else
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,8 +15,10 @@
 
 /* The split shape on a host that can make it itself: plain RW memory, an
    alias, and the original turned R-X. Works for macOS binaries without the
-   hardened runtime; on iOS the executable half has to come from a debugger. */
+   hardened runtime; on iOS the executable half has to come from a debugger.
+   On Linux/Android, memfd_create provides a dual-mapped RX + RW shared region. */
 static int open_split(HvJitRegion *region, size_t bytes) {
+#ifdef __APPLE__
     void *rx = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (rx == MAP_FAILED) return -1;
     vm_address_t rw = 0;
@@ -25,13 +32,48 @@ static int open_split(HvJitRegion *region, size_t bytes) {
     if (hv_jit_region_attach(region, rx, (void *)rw, bytes) != 0) return -1;
     region->owned = 1;
     return 0;
+#else
+    int fd = (int)syscall(SYS_memfd_create, "winvm_jit", 1U /* MFD_CLOEXEC */);
+    if (fd >= 0) {
+        if (ftruncate(fd, (off_t)bytes) == 0) {
+            void *rx = mmap(NULL, bytes, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0);
+            if (rx != MAP_FAILED) {
+                void *rw = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                if (rw != MAP_FAILED) {
+                    close(fd);
+                    if (hv_jit_region_attach(region, rx, rw, bytes) != 0) return -1;
+                    region->owned = 1;
+                    return 0;
+                }
+                munmap(rx, bytes);
+            }
+        }
+        close(fd);
+    }
+    /* Fallback if SELinux policy restricts PROT_EXEC on tmpfs/memfd but permits anonymous execmem */
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return -1;
+    region->base = p;
+    region->capacity = bytes / sizeof(uint32_t);
+    region->owned = 1;
+    return 0;
+#endif
 }
 
 int hv_jit_region_open(HvJitRegion *region, size_t bytes) {
     memset(region, 0, sizeof *region);
     if (getenv("HV_JIT_SPLIT")) return open_split(region, bytes);
-#if TARGET_OS_OSX
+#if defined(__APPLE__) && TARGET_OS_OSX
     void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    if (p == MAP_FAILED) return -1;
+    region->base = p;
+    region->capacity = bytes / sizeof(uint32_t);
+    region->owned = 1;
+    return 0;
+#elif !defined(__APPLE__)
+    /* On Linux/Android, prefer W^X dual-mapped memfd unless HV_JIT_RWX=1 is set, or fall back to anon RWX */
+    if (!getenv("HV_JIT_RWX") && open_split(region, bytes) == 0) return 0;
+    void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) return -1;
     region->base = p;
     region->capacity = bytes / sizeof(uint32_t);
@@ -67,7 +109,7 @@ void hv_jit_write(HvJitRegion *region, uint32_t *start, const void *src, size_t 
     if (bytes == 4) {
         uint32_t word;
         memcpy(&word, src, 4);
-#if TARGET_OS_OSX
+#if defined(__APPLE__) && TARGET_OS_OSX
         if (!region->rw_diff) pthread_jit_write_protect_np(0);
 #endif
         __atomic_store_n((uint32_t *)((uint8_t *)start + region->rw_diff), word, __ATOMIC_RELEASE);
@@ -77,7 +119,7 @@ void hv_jit_write(HvJitRegion *region, uint32_t *start, const void *src, size_t 
         memcpy((uint8_t *)start + region->rw_diff, src, bytes);
         return;
     }
-#if TARGET_OS_OSX
+#if defined(__APPLE__) && TARGET_OS_OSX
     pthread_jit_write_protect_np(0); /* MAP_JIT: writable on this thread only, until hv_jit_finish */
 #endif
     memcpy(start, src, bytes);
@@ -85,10 +127,16 @@ void hv_jit_write(HvJitRegion *region, uint32_t *start, const void *src, size_t 
 
 void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words) {
     (void)region;
-#if TARGET_OS_OSX
+#if defined(__APPLE__) && TARGET_OS_OSX
     if (!region->rw_diff) pthread_jit_write_protect_np(1);
 #endif
-    if (start && words) sys_icache_invalidate(start, words * sizeof(uint32_t));
+    if (start && words) {
+#ifdef __APPLE__
+        sys_icache_invalidate(start, words * sizeof(uint32_t));
+#else
+        __builtin___clear_cache((char *)start, (char *)(start + words));
+#endif
+    }
 }
 
 /* Any thread: an even number of words (blocks stay 8-byte aligned), taken atomically. */
