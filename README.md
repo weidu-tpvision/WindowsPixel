@@ -221,13 +221,24 @@ Windows 11 24H2 refuses FDT/DeviceTree boot and demands a compliant ServerReady/
 # 1. Build core engine, unit tests, hvsparse, and standalone Linux runner (with embedded libslirp)
 make -j8 && make test-core
 
-# 2. Boot Windows 11 ARM64 (with built-in HTML5 Canvas viewer on :8080 and VNC on :5900)
-dd if=/dev/zero of=work/vars.fd bs=1M count=64 status=none   # if resetting stale UEFI BootOrder
+# 2. If connecting over SSH, forward the built-in web viewer (:8080) and/or VNC (:5900) ports from your local machine:
+ssh -N -L 8080:localhost:8080 -L 5900:localhost:5900 <user>@<spark-host>
+
+# 3. First-time provisioning (reset vars.fd once if UEFI has a stale BootOrder):
+dd if=/dev/zero of=work/vars.fd bs=1M count=64 status=none
 ./build/winvm \
   --code work/code.fd --vars work/vars.fd \
   --disk work/windows11.img --disk1 work/installer.img \
   --cpus 4 --ram 4608 --web 8080 --vnc 5900
+
+# 4. Boot installed Windows 11 (drop --disk1 and keep vars.fd):
+./build/winvm \
+  --code work/code.fd --vars work/vars.fd \
+  --disk work/windows11.img \
+  --cpus 4 --ram 4608 --web 8080 --vnc 5900
 ```
+Open **`http://localhost:8080`** in your local browser (or connect a VNC client to `localhost:5900`).
+> **Note on `WINPE` installer drive letters:** If `installer.img` uses a GPT EFI System Partition (`EF00`), WinPE intentionally does not auto-assign it a drive letter (`no ltr`). If `startnet.cmd` stops with `no path found`, run `(echo select volume 2 & echo assign letter=I) | diskpart` and then `X:\Windows\System32\startnet.cmd`.
 
 ### B. Android ARM64 (Google Pixel 9 / Tensor G4 & Android 15/16)
 ```bash

@@ -220,11 +220,27 @@ flowchart LR
 ## 6. Next Steps (Stage A Ready $\to$ Stage B: Pixel 9)
 
 1. **Stage A Complete (`spark-20aa` Linux ARM64):**
-   * `./build/winvm` is verified booting Windows 11 ARM64 on `spark-20aa`. To run unattended Win11 provisioning on `work/windows11.img` or boot an existing disk:
-     ```bash
-     dd if=/dev/zero of=work/vars.fd bs=1M count=64 status=none
-     ./build/winvm --code work/code.fd --vars work/vars.fd --disk work/windows11.img --disk1 work/installer.img --cpus 4 --ram 4608 --web 8080 --vnc 5900
-     ```
+   * `./build/winvm` is verified booting Windows 11 ARM64 on `spark-20aa` and provisioning a full 18 GB Windows 11 installation onto `work/windows11.img`.
+   * **Usage on DGX Spark over SSH:**
+     1. Forward the web viewer (and optional VNC) port from your local machine:
+        ```bash
+        ssh -N -L 8080:localhost:8080 -L 5900:localhost:5900 weidu@spark-20aa
+        ```
+     2. *(First-time / provisioning only)* Reset `work/vars.fd` if it has a stale `BootOrder` (`>>Start PXE over IPv4.`), and boot with the installer attached:
+        ```bash
+        dd if=/dev/zero of=work/vars.fd bs=1M count=64 status=none
+        ./build/winvm --code work/code.fd --vars work/vars.fd --disk work/windows11.img --disk1 work/installer.img --cpus 4 --ram 4608 --web 8080 --vnc 5900
+        ```
+        > **WinPE ESP Drive-Letter Note:** Because `installer.img` uses a GPT **EFI System Partition (`EF00`)** so UEFI can boot `\EFI\BOOT\bootaa64.efi`, Windows `mountmgr.sys` intentionally does not auto-assign it a drive letter (`no ltr` in `diskpart`). If `startnet.cmd` drops to `X:\windows\system32>` complaining it cannot find `install.swm`, assign a letter and re-run it:
+        > ```bat
+        > (echo select volume 2 & echo assign letter=I) | diskpart
+        > X:\Windows\System32\startnet.cmd
+        > ```
+     3. **Post-install normal boot** (drop `--disk1` and **do not** zero `vars.fd` so UEFI keeps the Windows Boot Manager entry):
+        ```bash
+        ./build/winvm --code work/code.fd --vars work/vars.fd --disk work/windows11.img --cpus 4 --ram 4608 --web 8080 --vnc 5900
+        ```
+     4. Open `http://localhost:8080` in your local browser (or connect a VNC viewer to `localhost:5900`).
 2. **Step 1 (Stage B) — Pixel 9 Display Blitter (`devices/fb_android.c`):**
    * Implement `ANativeWindow` + OpenGL ES 3.0 / Vulkan 120 Hz rendering with hardware `BGRX8888` texture swizzling (`GL_TEXTURE_SWIZZLE_R = GL_BLUE`, `GL_TEXTURE_SWIZZLE_B = GL_RED`).
 3. **Step 2 (Stage B) — Pixel 9 Duplex Audio (`host/audio_android.cpp`):**
