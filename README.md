@@ -1,20 +1,34 @@
 <div align="center">
 
-# WindowsiOS
+# WindowsPixel
 
-**Full Microsoft Windows 11 24H2 ARM64 running at near-native JIT speed on non-jailbroken modern iOS.**  
-*Verified end-to-end on the foldable **iPhone Duo** (`iPhone19,4` · Apple A20 Pro · iOS 27 TXM) — without `Hypervisor.framework`.*
+**Full Microsoft Windows 11 24H2 ARM64 running at near-native JIT speed on Linux ARM64 (NVIDIA DGX Spark) and Android (Google Pixel 9 / Tensor G4 & more) — without root or KVM.**  
+*Forked from [`WindowsiOS`](https://github.com/ammaar/WindowsiOS) and adapted in two stages: **Stage A: DGX Spark (Linux ARM64 — Complete & Verified)** $\to$ **Stage B: Google Pixel 9 (Android 15/16 — Engine Ready, UI/AV In Progress)**.*
 
 [![License: GPL v2+](https://img.shields.io/badge/License-GPL--2.0--or--later-blue.svg)](LICENSE)
-[![Guest OS](https://img.shields.io/badge/Guest-Windows_11_24H2_ARM64_(Build_26100)-0078D4.svg)](#visual-showcase)
-[![Engine](https://img.shields.io/badge/Engine-ARM64→ARM64_TXM_JIT_%2B_4KB_ASID_MMU-10B981.svg)](#what-was-original--hard--built-here-with-gemini-4-carbon)
-[![Built With](https://img.shields.io/badge/Built_With-Gemini_4_Carbon-7C3AED.svg)](#what-was-original--hard--built-here-with-gemini-4-carbon)
+[![Guest OS](https://img.shields.io/badge/Guest-Windows_11_24H2_ARM64_(Build_26100%2B)-0078D4.svg)](#porting-status-dgx-spark--pixel-9)
+[![Engine](https://img.shields.io/badge/Engine-ARM64→ARM64_JIT_%2B_4KB_ASID_MMU-10B981.svg)](#system-architecture)
+[![Targets](https://img.shields.io/badge/Targets-DGX_Spark_Linux_%7C_Pixel_9_Android_%7C_iOS-7C3AED.svg)](#porting-status-dgx-spark--pixel-9)
 
 </div>
 
 ---
 
-## Visual Showcase
+## Porting Status: DGX Spark $\to$ Pixel 9 (and ARM64 Android)
+
+`WindowsPixel` adapts `WindowsiOS`'s custom ARM64-to-ARM64 dynamic binary translator and 4 KB software MMU from Apple Darwin/TXM to **standard Linux ARM64** and **non-rooted Android**:
+
+| Target / Stage | Status | Highlights |
+| :--- | :--- | :--- |
+| **Stage A: NVIDIA DGX Spark (`spark-20aa`, Linux ARM64)** | **Complete & Verified** | Standalone `./build/winvm` ([`host/main_linux.c`](host/main_linux.c)), 24.000 MHz JIT counter scaling, `memfd_create` RX/RW JIT, built-in HTML5 Canvas (`--web 8080`), RFB 3.8 VNC (`--vnc 5900`), pure-C PNG export, vendored `libslirp` v4.8.0 NAT. **Verified booting Windows 11 ARM64 (Build 26300) WinPE GUI across 4 vCPUs.** |
+| **Stage B: Google Pixel 9 (Tensor G4, Android 15/16) & ARM64 Android** | **Engine Ready · UI/AV Next** | `make android-lib` builds `build/android/libwinvm.so` & `.a` (NDK API 34, `-DHAVE_SLIRP=1`, Tensor G4 `cpus 4..7` pinning, SELinux `execmem` fallback, `MAP_NORESERVE` RAM). Next: `ANativeWindow` 120 Hz Vulkan/GLES blitter, Oboe/AAudio duplex sound, Jetpack Compose + Chrome Custom Tabs OAuth UI. |
+| **macOS & iOS (`WindowsiOS` upstream)** | **Preserved** | All `#ifdef __APPLE__` Metal, CoreAudio, TXM, and Xcode/iOS paths remain intact. |
+
+See [`docs/pixel_9_porting_plan.md`](docs/pixel_9_porting_plan.md) and [`docs/android_toolchain_setup.md`](docs/android_toolchain_setup.md) for the full architecture review, Tensor G4 / Linux findings, and Stage B roadmap.
+
+---
+
+## Upstream Visual Showcase (`WindowsiOS`)
 
 <table>
   <tr>
@@ -107,20 +121,20 @@ flowchart TB
         MMU["4 KB Stage-1 Software MMU · ASID-Keyed HvTlbStash · 2 MB / 1 GB Bloom Filters · 16-Table IJC"]
     end
 
-    subgraph Host["Non-Jailbroken iOS 26/27 TXM Host — Foldable iPhone Duo (iPhone19,4 · A20 Pro)"]
-        TXM["384 MiB Dual-Mapped RX/RW TXM JIT (< 0x7000000000) + 4.5 GB Ledger-Exempt Guest RAM"]
-        UI["Midnight-Sapphire Surface Laptop Ultra UI (UIHingeInteraction Clamshell / Open Studio + 120Hz Metal)"]
-        IOSIO["CoreAudio RemoteIO + AudioQueueInput · SFSafariViewController Passkey/Google OAuth Sheet"]
+    subgraph Host["Linux ARM64 (DGX Spark) · Android (Pixel 9) · iOS Hosts"]
+        JITMEM["memfd_create RX/RW + SELinux execmem JIT (Linux/Android) · 384 MiB TXM JIT (iOS)"]
+        UI["HTML5 Canvas / VNC Server (DGX Spark) · ANativeWindow + Compose (Pixel 9) · 120Hz Metal (iOS)"]
+        HOSTIO["Vendored libslirp v4.8.0 NAT · Oboe/AAudio (Android) / CoreAudio (iOS) · Chrome Custom Tabs / SafariSheet"]
     end
 
     UEFI --> ACPI
     NT --> NVMe & XHCI & HDA & VNET
     Guest --> JIT
     JIT <--> MMU
-    Engine --> TXM
+    Engine --> JITMEM
     XHCI <--> UI
-    HDA <--> IOSIO
-    VNET <--> IOSIO
+    HDA <--> HOSTIO
+    VNET <--> HOSTIO
     VirtHW --> UI
 ```
 
@@ -198,11 +212,31 @@ Windows 11 24H2 refuses FDT/DeviceTree boot and demands a compliant ServerReady/
 
 ---
 
-## Building, Provisioning & Deploying
+## Building, Provisioning & Running
 
 > **Note:** No disk images (`*.img`, `*.hvsparse`), UEFI firmware binaries (`*.fd`), or Windows/driver ISOs (`*.esd`, `*.iso`, `*.exe`) are stored in git. All large artifacts live exclusively inside `work/` and `build/` (enforced by [`.gitignore`](.gitignore)).
 
-### Prerequisites
+### A. Linux ARM64 (NVIDIA DGX Spark `spark-20aa`)
+```bash
+# 1. Build core engine, unit tests, hvsparse, and standalone Linux runner (with embedded libslirp)
+make -j8 && make test-core
+
+# 2. Boot Windows 11 ARM64 (with built-in HTML5 Canvas viewer on :8080 and VNC on :5900)
+dd if=/dev/zero of=work/vars.fd bs=1M count=64 status=none   # if resetting stale UEFI BootOrder
+./build/winvm \
+  --code work/code.fd --vars work/vars.fd \
+  --disk work/windows11.img --disk1 work/installer.img \
+  --cpus 4 --ram 4608 --web 8080 --vnc 5900
+```
+
+### B. Android ARM64 (Google Pixel 9 / Tensor G4 & Android 15/16)
+```bash
+# Cross-compile libwinvm.so and libwinvm.a with Android NDK (API 34, arm64-v8a, embedded libslirp)
+make android-lib -j8
+# Output: build/android/libwinvm.so and build/android/libwinvm.a
+```
+
+### C. macOS & iOS (Upstream `WindowsiOS` Build)
 - macOS on Apple Silicon (`M1` or newer; developed on M5 Pro) with Xcode, `xcodegen`, `meson`, `ninja`, `pkg-config`, `libslirp`, `llvm`/`lld` (for compiling freestanding `AArch64` Win32 guest helpers), and Python 3.
 - An official Microsoft **Windows 11 24H2 ARM64** retail ESD placed at `work/downloads/Win11_24H2_ARM64_en-us.esd`, EDK2 `QEMU_EFI.fd` at `work/code.fd`, and WHQL `virtio-win` `NetKVM` (`w11/ARM64`) drivers.
 
@@ -254,15 +288,17 @@ xcrun devicectl device install app --device <DEVICE_UDID> \
 ## Repository Layout
 
 ```text
-WindowsiOS/
-├── core/         # ARM64-to-ARM64 JIT compiler, 4 KB stage-1 software MMU, ASID HvTlbStash, LSE/LRCPC2 helpers
-├── devices/      # UEFI pflash, ACPI 6.3, GICv3 + ITS, PCIe GPEX, NVMe 1.4, USB 3.0 xHCI, Intel HDA, VirtIO-Net, 120Hz Metal fb
-├── host/         # Mach entry/exit assembly (enter.S), dual-mapped JIT allocator, CoreAudio full-duplex backend, libslirp NAT, WebDAV/OAuth share, hvsparse
-├── ios/          # SwiftUI + UIKit iPhone Duo app (UIHingeInteraction Clamshell/Studio UI, 120Hz MetalDisplayView, SafariSheet OAuth, TXM JIT bridge)
+WindowsPixel/
+├── core/         # ARM64-to-ARM64 JIT compiler, 4 KB stage-1 MMU, 24 MHz counter scaling, ASID HvTlbStash, LSE/LRCPC2 helpers
+├── devices/      # UEFI pflash, ACPI 6.3, GICv3 + ITS, PCIe GPEX, NVMe 1.4, USB 3.0 xHCI, Intel HDA, VirtIO-Net, ramfb + PNG/Metal
+├── host/         # Entry assembly (enter.S), Linux/Android/macOS runners (main_linux.c, main_mac.m), memfd/TXM JIT, libslirp NAT, share, hvsparse
+├── third_party/  # Self-contained vendored libslirp v4.8.0 + glib.h compatibility shim (zero external deps on Linux/Android)
+├── docs/         # Two-stage DGX Spark -> Pixel 9 porting plan, technical review, Android NDK setup, and upstream showcase images
+├── ios/          # SwiftUI + UIKit iPhone Duo app (upstream WindowsiOS)
 ├── scripts/      # Automated iOS dep builder, Windows 11 ARM64 ESD provisioner, Featherweight hive optimizer, and LLDB TXM launcher
 ├── tools/        # hvsparse CLI, freestanding ARM64 WinPE hive surgery (opt_hive_arm64.c), and WinIOSBrowser.exe OAuth relay (winios_browser_arm64.c)
-├── tests/        # Instruction classifier, operand decoder, JIT block, exclusive/LRCPC2 memory, exception, and 4 KB MMU unit test suites
-├── docs/images/  # Verified physical iPhone Duo & macOS showcase screenshots
+├── tests/        # Dual Mach-O/ELF unit test suites (classify, jit_region, operands, jit, mem, mmu, exc, bench)
+├── CMakeLists.txt
 ├── LICENSE       # GNU General Public License v2.0 or later (GPL-2.0-or-later)
 └── THIRD_PARTY_NOTICES.md
 ```
@@ -271,4 +307,4 @@ WindowsiOS/
 
 ## License
 
-`WindowsiOS` is free software licensed under the **GNU General Public License v2.0 or later** (`GPL-2.0-or-later`). See [`LICENSE`](LICENSE) for the full license text and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for complete upstream attributions and third-party license notices.
+`WindowsPixel` (forked from `WindowsiOS`) is free software licensed under the **GNU General Public License v2.0 or later** (`GPL-2.0-or-later`). See [`LICENSE`](LICENSE) for the full license text and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for complete upstream attributions and third-party license notices.
