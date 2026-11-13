@@ -253,8 +253,15 @@ Open **`http://localhost:8080`** in your local browser (or connect a VNC client 
 make android-lib -j8
 # Output: build/android/libwinvm.a, build/android/libwinvm.so, build/android/libwinvm_jni.so
 
-# 2. Build & install the Android APK (open android/ in Android Studio on macOS/x86_64 PC, or via system Gradle):
-cd android && gradle installDebug
+# 2. Build & install the Android APK:
+#    On macOS / x86_64 PC (or Android Studio):
+cd android && ./gradlew installDebug
+
+#    Or directly on Linux ARM64 (spark-20aa) using prebuilt JNI + native ARM64 aapt2:
+mkdir -p android/app/src/main/jniLibs/arm64-v8a
+cp build/android/libwinvm_jni.so android/app/src/main/jniLibs/arm64-v8a/
+cd android && ./gradlew assembleDebug -PusePrebuiltJni=true -Pandroid.aapt2FromMavenOverride="$HOME/.local/bin/aapt2"
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 # 3. Push your provisioned UEFI + Windows 11 images to the Pixel 9:
 #    (Optional) Pack windows11.img into a compact zero-skipping .hvsparse file first:

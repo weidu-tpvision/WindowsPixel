@@ -108,10 +108,16 @@ PATH=$HOME/.local/bin:$PATH make test-core
 PATH=$HOME/.local/bin:$PATH make build/test_bench && ./build/test_bench
 ```
 
-### B. Cross-Compile `libwinvm.so` & `libwinvm.a` for Android (Pixel 9 / API 34)
+### B. Cross-Compile `libwinvm.so` & `libwinvm.a` and Build the Android APK (Pixel 9 / API 34)
 ```bash
 PATH=$HOME/.local/bin:$PATH make android-lib -j$(nproc)
-file build/android/libwinvm.so build/android/libwinvm.a
+file build/android/libwinvm.so build/android/libwinvm.a build/android/libwinvm_jni.so
+
+# Package the debug APK directly on Linux ARM64 using the prebuilt JNI library + native ARM64 aapt2:
+mkdir -p android/app/src/main/jniLibs/arm64-v8a
+cp build/android/libwinvm_jni.so android/app/src/main/jniLibs/arm64-v8a/
+cd android && ./gradlew assembleDebug -PusePrebuiltJni=true -Pandroid.aapt2FromMavenOverride="$HOME/.local/bin/aapt2"
+# Output: android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
 ### C. Using with CMake (`CMakeLists.txt`)

@@ -9,6 +9,7 @@ android/.gradle/
 android/build/
 android/app/build/
 android/app/.cxx/
+android/app/src/main/jniLibs/
 
 # App bundles & object archives
 *.ipa

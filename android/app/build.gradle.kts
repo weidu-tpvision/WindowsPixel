@@ -9,6 +9,8 @@ android {
     compileSdk = 34
     ndkVersion = "27.2.12479018"
 
+    val usePrebuiltJni = providers.gradleProperty("usePrebuiltJni").orNull == "true"
+
     defaultConfig {
         applicationId = "com.winpixel.app"
         minSdk = 31
@@ -20,9 +22,11 @@ android {
             abiFilters += "arm64-v8a"
         }
 
-        externalNativeBuild {
-            cmake {
-                arguments += listOf("-DWINVM_BUILD_TESTS=OFF")
+        if (!usePrebuiltJni) {
+            externalNativeBuild {
+                cmake {
+                    arguments += listOf("-DWINVM_BUILD_TESTS=OFF")
+                }
             }
         }
     }
@@ -46,10 +50,14 @@ android {
         compose = true
     }
 
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
+    if (usePrebuiltJni) {
+        sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
+    } else {
+        externalNativeBuild {
+            cmake {
+                path = file("src/main/cpp/CMakeLists.txt")
+                version = "3.22.1"
+            }
         }
     }
 }
