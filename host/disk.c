@@ -3,15 +3,24 @@
 #include "disk.h"
 
 #include <fcntl.h>
+#include <stdio.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
     d->fd = open(path, readonly ? O_RDONLY : O_RDWR);
     if (d->fd < 0) return -1;
+    if (!readonly && flock(d->fd, LOCK_EX | LOCK_NB) != 0) {
+        fprintf(stderr, "winvm: disk %s is already locked by another process!\n", path);
+        close(d->fd);
+        d->fd = -1;
+        return -1;
+    }
     struct stat st;
     if (fstat(d->fd, &st) != 0 || (uint64_t)st.st_size < offset) {
         close(d->fd);
+        d->fd = -1;
         return -1;
     }
     d->offset = offset;
@@ -21,7 +30,10 @@ int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
 }
 
 void hv_disk_close(HvDisk *d) {
-    if (d->fd >= 0) close(d->fd);
+    if (d->fd >= 0) {
+        if (!d->readonly) flock(d->fd, LOCK_UN);
+        close(d->fd);
+    }
     d->fd = -1;
 }
 
