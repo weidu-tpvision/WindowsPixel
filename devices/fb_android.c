@@ -232,6 +232,12 @@ static void *fb_render_thread(void *arg) {
 
     if (egl_init_context(&e) != 0) {
         egl_destroy_all(&e);
+        /* Let the next set_window retry with a fresh thread; nobody will join this one. */
+        pthread_mutex_lock(&g_fb_mu);
+        g_thread_started = 0;
+        pthread_detach(pthread_self());
+        pthread_cond_broadcast(&g_fb_ack_cv);
+        pthread_mutex_unlock(&g_fb_mu);
         return NULL;
     }
 
@@ -260,17 +266,21 @@ static void *fb_render_thread(void *arg) {
         int changed = g_win_changed;
         g_win_changed = 0;
         if (win) ANativeWindow_acquire(win);
+        /* Claim the window before unlocking: a surfaceDestroyed arriving while the bind is in flight
+           must wait for us (set_window(NULL) waits while g_surface_bound). */
+        if (changed || e.surf == EGL_NO_SURFACE) g_surface_bound = 1;
         pthread_mutex_unlock(&g_fb_mu);
 
         if (changed || e.surf == EGL_NO_SURFACE) {
             if (egl_bind_window(&e, win) != 0) {
                 if (win) ANativeWindow_release(win);
+                pthread_mutex_lock(&g_fb_mu);
+                g_surface_bound = 0;
+                pthread_cond_broadcast(&g_fb_ack_cv);
+                pthread_mutex_unlock(&g_fb_mu);
                 usleep(16000);
                 continue;
             }
-            pthread_mutex_lock(&g_fb_mu);
-            g_surface_bound = 1;
-            pthread_mutex_unlock(&g_fb_mu);
         }
 
         EGLint surf_w = 0, surf_h = 0;
@@ -347,11 +357,15 @@ static void *fb_render_thread(void *arg) {
 
 void hv_fb_android_set_window(HvFbDisplay *fb, struct ANativeWindow *win) {
     pthread_mutex_lock(&g_fb_mu);
-    if (fb) g_fb_disp = fb;
-    if (g_win) ANativeWindow_release(g_win);
-    g_win = win;
-    if (g_win) ANativeWindow_acquire(g_win);
-    g_win_changed = 1;
+    g_fb_disp = fb; /* NULL when no VM: never keep a display that hv_winvm_destroy may free */
+    /* surfaceChanged hands the same window again: keep its EGL surface (it follows resizes itself).
+       g_win holds a reference, so an equal pointer really is the same window. */
+    if (win != g_win) {
+        if (g_win) ANativeWindow_release(g_win);
+        g_win = win;
+        if (g_win) ANativeWindow_acquire(g_win);
+        g_win_changed = 1;
+    }
     if (!g_thread_started && g_win) {
         g_stop_thread = 0;
         if (pthread_create(&g_render_thread, NULL, fb_render_thread, NULL) == 0)
@@ -375,6 +389,7 @@ void hv_fb_android_shutdown(void) {
     pthread_mutex_lock(&g_fb_mu);
     int started = g_thread_started;
     g_stop_thread = 1;
+    g_fb_disp = NULL;
     if (g_win) {
         ANativeWindow_release(g_win);
         g_win = NULL;

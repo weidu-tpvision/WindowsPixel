@@ -131,7 +131,8 @@ flowchart TB
 # 1. Build core engine, unit tests, hvsparse, and standalone Linux runner (with embedded libslirp)
 make -j8 && make test-core
 
-# 2. If connecting over SSH, forward the built-in web viewer (:8080) and/or VNC (:5900) ports from your local machine:
+# 2. The web viewer and VNC server have no authentication, so they bind to 127.0.0.1 by default.
+#    From another machine, forward them over SSH (or pass --listen 0.0.0.0, only on a trusted network):
 ssh -N -L 8080:localhost:8080 -L 5900:localhost:5900 <user>@<spark-host>
 
 # 3. First-time provisioning (reset vars.fd once if UEFI has a stale BootOrder):

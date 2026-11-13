@@ -100,6 +100,7 @@ class MainActivity : ComponentActivity() {
         val scope = rememberCoroutineScope()
         var running by remember { mutableStateOf(WinVmBridge.nativeIsRunning()) }
         var starting by remember { mutableStateOf(false) }
+        var stopping by remember { mutableStateOf(false) }
         var errorMsg by remember { mutableStateOf<String?>(null) }
         var cpus by remember { mutableIntStateOf(4) }
         var ramMb by remember { mutableIntStateOf(4096) }
@@ -124,6 +125,9 @@ class MainActivity : ComponentActivity() {
         LaunchedEffect(running) {
             while (running) {
                 if (!WinVmBridge.nativeIsRunning()) {
+                    // The guest shut down by itself: release RAM, JIT, disk locks, audio and SLIRP now,
+                    // not on the next boot, since the process loses its foreground service here.
+                    withContext(Dispatchers.IO) { WinVmBridge.nativeStopVm() }
                     running = false
                     VmForegroundService.stop(this@MainActivity)
                     break
@@ -201,16 +205,18 @@ class MainActivity : ComponentActivity() {
                         TextButton(onClick = { WinVmBridge.nativePowerButton() }) {
                             Text("Power", color = Color(0xFFFFB74D), fontSize = 12.sp)
                         }
-                        TextButton(onClick = {
+                        TextButton(enabled = !stopping, onClick = {
+                            stopping = true
                             scope.launch {
                                 withContext(Dispatchers.IO) {
                                     WinVmBridge.nativeStopVm()
                                 }
                                 VmForegroundService.stop(this@MainActivity)
                                 running = false
+                                stopping = false
                             }
                         }) {
-                            Text("Stop", color = Color(0xFFEF5350), fontSize = 12.sp)
+                            Text(if (stopping) "Stopping..." else "Stop", color = Color(0xFFEF5350), fontSize = 12.sp)
                         }
                         TextButton(onClick = { showToolbar = false }) {
                             Text("Hide", color = Color.Gray, fontSize = 12.sp)
@@ -291,7 +297,6 @@ class MainActivity : ComponentActivity() {
                         onClick = {
                             errorMsg = null
                             starting = true
-                            VmForegroundService.start(this@MainActivity)
                             scope.launch {
                                 val err = withContext(Dispatchers.IO) {
                                     WinVmBridge.nativeStartVm(
@@ -310,8 +315,10 @@ class MainActivity : ComponentActivity() {
                                 starting = false
                                 if (err != null) {
                                     errorMsg = err
-                                    VmForegroundService.stop(this@MainActivity)
                                 } else {
+                                    // Only now: stopping a service between startForegroundService() and
+                                    // its startForeground() crashes the app on API 31+.
+                                    VmForegroundService.start(this@MainActivity)
                                     running = true
                                 }
                             }
@@ -398,6 +405,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val shiftedUsages = HashSet<Int>()
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (WinVmBridge.nativeIsRunning()) {
             val down = event.action == KeyEvent.ACTION_DOWN
@@ -405,9 +414,11 @@ class MainActivity : ComponentActivity() {
             if (down || up) {
                 val usage = androidKeyToHid(event.keyCode)
                 if (usage != 0) {
-                    if (event.isShiftPressed && down) WinVmBridge.nativeKeyHid(0xe1, true)
+                    // Shift is synthesized around the key it modified; release it on that key's up even
+                    // if the IME already dropped its shift state, or it would stay stuck in the guest.
+                    if (down && event.isShiftPressed && shiftedUsages.add(usage)) WinVmBridge.nativeKeyHid(0xe1, true)
                     WinVmBridge.nativeKeyHid(usage, down)
-                    if (event.isShiftPressed && up) WinVmBridge.nativeKeyHid(0xe1, false)
+                    if (up && shiftedUsages.remove(usage)) WinVmBridge.nativeKeyHid(0xe1, false)
                     return true
                 }
             }

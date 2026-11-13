@@ -13,19 +13,27 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "winvm-audio", __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "winvm-audio", __VA_ARGS__)
 
 static pthread_mutex_t g_audio_mu = PTHREAD_MUTEX_INITIALIZER;
+/* Set by hv_audio_shutdown, cleared by hv_audio_attach_hda: once the VM is going down no stream may
+   be (re)opened, because the callbacks' userData is the HvHda that hv_winvm_destroy frees. */
+static int g_audio_closed = 0;
 
-static AAudioStream *g_out_stream = NULL;
-static int g_out_running = 0;
-static unsigned g_out_ch = 0, g_out_rate = 0;
-
-static AAudioStream *g_in_stream = NULL;
-static int g_in_running = 0;
-static unsigned g_in_ch = 0, g_in_rate = 0;
+/* One direction's stream. AAudio streams die on route changes (headphones, Bluetooth): the error
+   callback then reopens it with the same parameters, from a fresh thread as AAudio requires. */
+typedef struct AudioDir {
+    aaudio_direction_t dir;
+    const char *name;
+    AAudioStream_dataCallback cb;
+    AAudioStream *stream;
+    int running;
+    unsigned ch, rate;
+    HvHda *hda;
+} AudioDir;
 
 static aaudio_data_callback_result_t out_data_cb(AAudioStream *stream, void *userData,
                                                  void *audioData, int32_t numFrames) {
@@ -49,134 +57,135 @@ static aaudio_data_callback_result_t in_data_cb(AAudioStream *stream, void *user
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
-static int hda_start_out(void *opaque, unsigned channels, unsigned rate_hz) {
-    HvHda *hda = (HvHda *)opaque;
-    if (channels < 1 || channels > 2) channels = 2;
-    if (rate_hz < 8000 || rate_hz > 192000) rate_hz = 48000;
+static AudioDir g_out = {AAUDIO_DIRECTION_OUTPUT, "output", out_data_cb, NULL, 0, 0, 0, NULL};
+static AudioDir g_in = {AAUDIO_DIRECTION_INPUT, "input", in_data_cb, NULL, 0, 0, 0, NULL};
 
-    pthread_mutex_lock(&g_audio_mu);
-    if (g_out_stream && (channels != g_out_ch || rate_hz != g_out_rate)) {
-        AAudioStream_requestStop(g_out_stream);
-        AAudioStream_close(g_out_stream);
-        g_out_stream = NULL;
-        g_out_running = 0;
-    }
+static void error_cb(AAudioStream *stream, void *userData, aaudio_result_t error);
 
-    if (!g_out_stream) {
+static void close_locked(AudioDir *d) {
+    if (!d->stream) return;
+    if (d->running) AAudioStream_requestStop(d->stream);
+    AAudioStream_close(d->stream);
+    d->stream = NULL;
+    d->running = 0;
+}
+
+/* g_audio_mu held. Opens (if needed) and starts d's stream; 0 if it is running. */
+static int start_locked(AudioDir *d, HvHda *hda, unsigned channels, unsigned rate_hz) {
+    if (g_audio_closed) return -1;
+    if (d->stream && (channels != d->ch || rate_hz != d->rate || hda != d->hda)) close_locked(d);
+    if (!d->stream) {
         AAudioStreamBuilder *b = NULL;
-        if (AAudio_createStreamBuilder(&b) != AAUDIO_OK || !b) {
-            pthread_mutex_unlock(&g_audio_mu);
-            return -1;
-        }
-        AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
+        if (AAudio_createStreamBuilder(&b) != AAUDIO_OK || !b) return -1;
+        AAudioStreamBuilder_setDirection(b, d->dir);
         AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_SHARED);
         AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
         AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
         AAudioStreamBuilder_setChannelCount(b, (int32_t)channels);
         AAudioStreamBuilder_setSampleRate(b, (int32_t)rate_hz);
-        AAudioStreamBuilder_setDataCallback(b, out_data_cb, hda);
-
-        aaudio_result_t rc = AAudioStreamBuilder_openStream(b, &g_out_stream);
+        AAudioStreamBuilder_setDataCallback(b, d->cb, hda);
+        AAudioStreamBuilder_setErrorCallback(b, error_cb, d);
+        aaudio_result_t rc = AAudioStreamBuilder_openStream(b, &d->stream);
         AAudioStreamBuilder_delete(b);
-        if (rc != AAUDIO_OK || !g_out_stream) {
-            LOGW("AAudio output openStream failed: %d", rc);
-            g_out_stream = NULL;
-            pthread_mutex_unlock(&g_audio_mu);
+        if (rc != AAUDIO_OK || !d->stream) {
+            LOGW("AAudio %s openStream failed: %d%s", d->name, rc,
+                 d->dir == AAUDIO_DIRECTION_INPUT ? " (RECORD_AUDIO permission pending?)" : "");
+            d->stream = NULL;
             return -1;
         }
-        g_out_ch = channels;
-        g_out_rate = rate_hz;
+        d->ch = channels;
+        d->rate = rate_hz;
+        d->hda = hda;
     }
-
-    if (!g_out_running) {
-        aaudio_result_t rc = AAudioStream_requestStart(g_out_stream);
+    if (!d->running) {
+        aaudio_result_t rc = AAudioStream_requestStart(d->stream);
         if (rc == AAUDIO_OK) {
-            g_out_running = 1;
-            LOGI("AAudio output started (%u ch @ %u Hz)", channels, rate_hz);
+            d->running = 1;
+            LOGI("AAudio %s started (%u ch @ %u Hz)", d->name, channels, rate_hz);
         } else {
-            LOGW("AAudio output requestStart failed: %d", rc);
+            LOGW("AAudio %s requestStart failed: %d", d->name, rc);
         }
     }
-    int ok = g_out_running ? 0 : -1;
+    return d->running ? 0 : -1;
+}
+
+typedef struct Reopen {
+    AudioDir *d;
+    AAudioStream *dead;
+} Reopen;
+
+static void *reopen_thread(void *arg) {
+    Reopen r = *(Reopen *)arg;
+    free(arg);
+    pthread_mutex_lock(&g_audio_mu);
+    /* Only if the dead stream is still the current one, and the guest still wants it running. */
+    if (r.d->stream == r.dead && !g_audio_closed) {
+        int was_running = r.d->running;
+        close_locked(r.d);
+        if (was_running && start_locked(r.d, r.d->hda, r.d->ch, r.d->rate) == 0)
+            LOGI("AAudio %s reopened after disconnect", r.d->name);
+    }
+    pthread_mutex_unlock(&g_audio_mu);
+    return NULL;
+}
+
+static void error_cb(AAudioStream *stream, void *userData, aaudio_result_t error) {
+    LOGW("AAudio %s stream error %d", ((AudioDir *)userData)->name, error);
+    if (error != AAUDIO_ERROR_DISCONNECTED) return;
+    Reopen *r = malloc(sizeof *r);
+    if (!r) return;
+    r->d = (AudioDir *)userData;
+    r->dead = stream;
+    pthread_t t;
+    if (pthread_create(&t, NULL, reopen_thread, r) == 0) pthread_detach(t);
+    else free(r);
+}
+
+static void sanitize(unsigned *channels, unsigned *rate_hz) {
+    if (*channels < 1 || *channels > 2) *channels = 2;
+    if (*rate_hz < 8000 || *rate_hz > 192000) *rate_hz = 48000;
+}
+
+static int hda_start_out(void *opaque, unsigned channels, unsigned rate_hz) {
+    sanitize(&channels, &rate_hz);
+    pthread_mutex_lock(&g_audio_mu);
+    int ok = start_locked(&g_out, (HvHda *)opaque, channels, rate_hz);
     pthread_mutex_unlock(&g_audio_mu);
     return ok;
+}
+
+static int hda_start_in(void *opaque, unsigned channels, unsigned rate_hz) {
+    sanitize(&channels, &rate_hz);
+    pthread_mutex_lock(&g_audio_mu);
+    int ok = start_locked(&g_in, (HvHda *)opaque, channels, rate_hz);
+    pthread_mutex_unlock(&g_audio_mu);
+    return ok;
+}
+
+static void stop_dir(AudioDir *d) {
+    pthread_mutex_lock(&g_audio_mu);
+    if (d->stream && d->running) {
+        AAudioStream_requestStop(d->stream);
+        d->running = 0;
+    }
+    pthread_mutex_unlock(&g_audio_mu);
 }
 
 static void hda_stop_out(void *opaque) {
     (void)opaque;
-    pthread_mutex_lock(&g_audio_mu);
-    if (g_out_stream && g_out_running) {
-        AAudioStream_requestStop(g_out_stream);
-        g_out_running = 0;
-    }
-    pthread_mutex_unlock(&g_audio_mu);
-}
-
-static int hda_start_in(void *opaque, unsigned channels, unsigned rate_hz) {
-    HvHda *hda = (HvHda *)opaque;
-    if (channels < 1 || channels > 2) channels = 2;
-    if (rate_hz < 8000 || rate_hz > 192000) rate_hz = 48000;
-
-    pthread_mutex_lock(&g_audio_mu);
-    if (g_in_stream && (channels != g_in_ch || rate_hz != g_in_rate)) {
-        AAudioStream_requestStop(g_in_stream);
-        AAudioStream_close(g_in_stream);
-        g_in_stream = NULL;
-        g_in_running = 0;
-    }
-
-    if (!g_in_stream) {
-        AAudioStreamBuilder *b = NULL;
-        if (AAudio_createStreamBuilder(&b) != AAUDIO_OK || !b) {
-            pthread_mutex_unlock(&g_audio_mu);
-            return -1;
-        }
-        AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_INPUT);
-        AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_SHARED);
-        AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-        AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
-        AAudioStreamBuilder_setChannelCount(b, (int32_t)channels);
-        AAudioStreamBuilder_setSampleRate(b, (int32_t)rate_hz);
-        AAudioStreamBuilder_setDataCallback(b, in_data_cb, hda);
-
-        aaudio_result_t rc = AAudioStreamBuilder_openStream(b, &g_in_stream);
-        AAudioStreamBuilder_delete(b);
-        if (rc != AAUDIO_OK || !g_in_stream) {
-            LOGW("AAudio input openStream failed: %d (RECORD_AUDIO permission pending?)", rc);
-            g_in_stream = NULL;
-            pthread_mutex_unlock(&g_audio_mu);
-            return -1;
-        }
-        g_in_ch = channels;
-        g_in_rate = rate_hz;
-    }
-
-    if (!g_in_running) {
-        aaudio_result_t rc = AAudioStream_requestStart(g_in_stream);
-        if (rc == AAUDIO_OK) {
-            g_in_running = 1;
-            LOGI("AAudio input started (%u ch @ %u Hz)", channels, rate_hz);
-        } else {
-            LOGW("AAudio input requestStart failed: %d", rc);
-        }
-    }
-    int ok = g_in_running ? 0 : -1;
-    pthread_mutex_unlock(&g_audio_mu);
-    return ok;
+    stop_dir(&g_out);
 }
 
 static void hda_stop_in(void *opaque) {
     (void)opaque;
-    pthread_mutex_lock(&g_audio_mu);
-    if (g_in_stream && g_in_running) {
-        AAudioStream_requestStop(g_in_stream);
-        g_in_running = 0;
-    }
-    pthread_mutex_unlock(&g_audio_mu);
+    stop_dir(&g_in);
 }
 
 void hv_audio_attach_hda(HvHda *hda) {
     if (!hda) return;
+    pthread_mutex_lock(&g_audio_mu);
+    g_audio_closed = 0;
+    pthread_mutex_unlock(&g_audio_mu);
     hda->backend = (HvHdaBackend){
         .start_out = hda_start_out,
         .stop_out = hda_stop_out,
@@ -188,18 +197,9 @@ void hv_audio_attach_hda(HvHda *hda) {
 
 void hv_audio_shutdown(void) {
     pthread_mutex_lock(&g_audio_mu);
-    if (g_out_stream) {
-        if (g_out_running) AAudioStream_requestStop(g_out_stream);
-        AAudioStream_close(g_out_stream);
-        g_out_stream = NULL;
-        g_out_running = 0;
-    }
-    if (g_in_stream) {
-        if (g_in_running) AAudioStream_requestStop(g_in_stream);
-        AAudioStream_close(g_in_stream);
-        g_in_stream = NULL;
-        g_in_running = 0;
-    }
+    g_audio_closed = 1;
+    close_locked(&g_out);
+    close_locked(&g_in);
     pthread_mutex_unlock(&g_audio_mu);
 }
 

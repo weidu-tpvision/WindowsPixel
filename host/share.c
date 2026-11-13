@@ -343,6 +343,7 @@ static int decode_path(const char *in, char *out, size_t cap) {
             p += 2;
             if (c == 0) return -1;
         }
+        if (c == '/' && n && out[n - 1] == '/') continue; /* "a//b" is "a/b": keeps path comparisons exact */
         if (n + 1 >= cap) return -1;
         out[n++] = (char)c;
     }
@@ -352,6 +353,7 @@ static int decode_path(const char *in, char *out, size_t cap) {
         const char *part = s + 1, *end = strchr(part, '/');
         size_t len = end ? (size_t)(end - part) : strlen(part);
         if (len == 2 && part[0] == '.' && part[1] == '.') return -1;
+        if (len == 1 && part[0] == '.') return -1;
     }
     return 0;
 }
@@ -668,6 +670,13 @@ static int do_mkcol(Conn *c, Request *r) {
     return respond_empty(c, r, 403, "Forbidden");
 }
 
+/* Is path inside dir (dir itself excluded)? Both are already-resolved local paths. */
+static int path_within(const char *dir, const char *path) {
+    size_t n = strlen(dir);
+    while (n > 1 && dir[n - 1] == '/') n--;
+    return strncmp(dir, path, n) == 0 && path[n] == '/' && path[n + 1];
+}
+
 static int do_move_copy(Conn *c, Request *r, int move) {
     if (body_discard(c, r) != 0) return -1;
     char from[PATH_MAX], to[PATH_MAX];
@@ -676,6 +685,10 @@ static int do_move_copy(Conn *c, Request *r, int move) {
         local_path(r->destination, to, sizeof to) != 0)
         return respond_empty(c, r, 400, "Bad Request");
     if (stat(from, &st) != 0) return respond_empty(c, r, 404, "Not Found");
+    /* The destination is removed first when it exists: never let that be the share root or an
+       ancestor of the source (wiping the source with it), nor copy a folder into its own subtree. */
+    if (path_within(to, from) || path_within(from, to))
+        return respond_empty(c, r, 403, "Forbidden");
     int existed = stat(to, &st) == 0;
     if (existed && !r->overwrite) return respond_empty(c, r, 412, "Precondition Failed");
     if (existed && strcmp(from, to) != 0 && remove_path(to) != 0) return respond_empty(c, r, 403, "Forbidden");

@@ -497,7 +497,7 @@ static int wait_for_interrupt(HvCpu *cpu) {
         pthread_cond_timedwait_relative_np(&p->wake_cv, &p->wake_mu, &ts);
 #else
         struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
+        clock_gettime(CLOCK_MONOTONIC, &ts); /* wake_cv uses CLOCK_MONOTONIC (see hv_machine_init) */
         uint64_t add_ns = (wait_ticks % 24000000ull) * 1000ull / 24ull;
         ts.tv_sec += (time_t)(wait_ticks / 24000000ull);
         ts.tv_nsec += (long)add_ns;

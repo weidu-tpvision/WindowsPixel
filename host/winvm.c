@@ -202,20 +202,30 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     signal(SIGPIPE, SIG_IGN);
 
     HvDisk *d0_ptr = NULL, *d1_ptr = NULL;
+    const char *why = NULL;
+    int machine_up = 0;
     if (c->disk0 && *c->disk0) {
-        if (hv_disk_open(&disk0, c->disk0, 0, 0) != 0)
-            return fail(err, errlen, "Cannot open primary NVMe disk image.");
+        if (hv_disk_open(&disk0, c->disk0, 0, 0) != 0) {
+            why = "Cannot open primary NVMe disk image (missing, or locked by another winvm?).";
+            goto fail_out;
+        }
         d0_ptr = &disk0;
     }
     if (c->disk1 && *c->disk1) {
-        if (hv_disk_open(&disk1, c->disk1, 0, 1) != 0)
-            return fail(err, errlen, "Cannot open secondary/installer disk image.");
+        if (hv_disk_open(&disk1, c->disk1, 0, 1) != 0) {
+            why = "Cannot open secondary/installer disk image.";
+            goto fail_out;
+        }
         d1_ptr = &disk1;
     }
 
     size_t jit = c->jit_bytes ? c->jit_bytes : ((size_t)768 << 20);
     int r = c->jit_rx ? hv_machine_init_jit(&m, c->jit_rx, c->jit_rw, jit) : hv_machine_init(&m, jit);
-    if (r != 0) return fail(err, errlen, "Cannot initialize ARM64 JIT region (is JIT active?).");
+    machine_up = 1; /* even a partial init is safe to hv_machine_free */
+    if (r != 0) {
+        why = "Cannot initialize ARM64 JIT region (is JIT active?).";
+        goto fail_out;
+    }
 
 #if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
     /* Defer synchronous guest NVMe FLUSH fsyncs on mobile flash; explicit host checkpoints call hv_disk_sync(). */
@@ -232,7 +242,9 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     static const uint8_t mac[6] = {0x02, 0x57, 0x49, 0x4e, 0x00, 0x01};
     if (hv_winvirt_create(&board, &m, cpus, ncpus, ram_bytes, c->prealloc_ram, c->code_fd, c->vars_fd,
                           d0_ptr, d1_ptr, mac, c->enable_sound) != 0) {
-        return fail(err, errlen, "Cannot create virtual ARM64 Windows board (insufficient RAM or missing firmware).");
+        hv_winvirt_destroy(&board); /* frees whatever it got to; NULL members are fine */
+        why = "Cannot create virtual ARM64 Windows board (insufficient RAM or missing firmware).";
+        goto fail_out;
     }
     hv_winvirt_reset_cpu(&board);
 
@@ -265,6 +277,15 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
 
     vm_created = 1;
     return 0;
+
+fail_out:
+    /* Leave nothing behind: a leaked disk fd keeps its exclusive flock, so every retry in this
+       process (the Android app) would then fail to open the disk. */
+    if (machine_up) hv_machine_free(&m);
+    memset(&m, 0, sizeof m);
+    if (disk1.fd >= 0) hv_disk_close(&disk1);
+    if (disk0.fd >= 0) hv_disk_close(&disk0);
+    return fail(err, errlen, why);
 }
 
 static void *kicker_thread(void *unused) {
@@ -391,6 +412,7 @@ void hv_winvm_start(int spawn_cpu0, void (*on_exit)(int reason)) {
 
 void hv_winvm_stop(void) {
     atomic_store(&stop_requested, 1);
+    if (!vm_created) return; /* nothing running, or already destroyed: the machine may be freed */
 #if defined(__APPLE__) || defined(__ANDROID__)
     hv_audio_shutdown();
 #endif
@@ -421,8 +443,12 @@ void hv_winvm_destroy(void) {
         net_on = 0;
     }
     if (vm_created) {
+#if defined(__APPLE__) || defined(__ANDROID__)
+        hv_audio_shutdown(); /* again, now that no vCPU can restart a stream: its callbacks point at board.hda */
+#endif
         hv_winvirt_destroy(&board);
         hv_machine_free(&m);
+        memset(&m, 0, sizeof m);
         if (disk0.fd >= 0) { hv_disk_close(&disk0); disk0.fd = -1; }
         if (disk1.fd >= 0) { hv_disk_close(&disk1); disk1.fd = -1; }
         vm_created = 0;

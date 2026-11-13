@@ -3,6 +3,7 @@
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 
 #include "mmu.h"
@@ -97,7 +98,16 @@ static int init_rest(HvMachine *m) {
             if (!p->stash[k].slot || !p->stash[k].ent) return -1;
         }
         pthread_mutex_init(&p->wake_mu, NULL);
+#ifdef __APPLE__
         pthread_cond_init(&p->wake_cv, NULL);
+#else
+        /* wait_for_interrupt() waits with an absolute CLOCK_MONOTONIC deadline: immune to wall-clock steps. */
+        pthread_condattr_t ca;
+        pthread_condattr_init(&ca);
+        pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+        pthread_cond_init(&p->wake_cv, &ca);
+        pthread_condattr_destroy(&ca);
+#endif
         pthread_mutex_init(&p->req_mu, NULL);
     }
     return 0;

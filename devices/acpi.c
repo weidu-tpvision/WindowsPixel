@@ -713,20 +713,28 @@ static size_t build_iort(Buf *tabs) {
     return start;
 }
 
+/* One SMBIOS string-set entry. An empty string would read as the set's double-NUL terminator
+   and shift every later string reference, so host-derived values that come back empty become "Unknown". */
 static void b_str(Buf *b, const char *s) {
+    if (!s || !*s) s = "Unknown";
     b_put(b, s, strlen(s) + 1);
 }
 
 #if !defined(__APPLE__) && !defined(__ANDROID__)
+/* Reads a one-line sysfs/procfs string into out; leaves out untouched (keeping its default) if empty or missing. */
 static int read_sys_str(const char *path, char *out, size_t cap) {
+    char tmp[128];
     FILE *f = fopen(path, "r");
     if (!f) return 0;
-    size_t n = fread(out, 1, cap - 1, f);
+    size_t n = fread(tmp, 1, sizeof tmp - 1, f);
     fclose(f);
-    out[n] = '\0';
-    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' ' || out[n - 1] == '\0'))
-        out[--n] = '\0';
-    return n > 0;
+    tmp[n] = '\0';
+    n = strlen(tmp); /* device-tree strings carry their own NUL */
+    while (n > 0 && (tmp[n - 1] == '\n' || tmp[n - 1] == '\r' || tmp[n - 1] == ' '))
+        tmp[--n] = '\0';
+    if (!n) return 0;
+    snprintf(out, cap, "%s", tmp);
+    return 1;
 }
 
 static const char *lookup_arm_cpu_name(unsigned impl, unsigned part) {
@@ -753,14 +761,14 @@ static const char *lookup_arm_cpu_name(unsigned impl, unsigned part) {
         case 0xd80: return "ARM Cortex-A520";
         case 0xd81: return "ARM Cortex-A720";
         case 0xd82: return "ARM Cortex-X4";
-        case 0xd85:
-        case 0xd87: return "ARM Cortex-X925";
+        case 0xd85: return "ARM Cortex-X925";
+        case 0xd87: return "ARM Cortex-A725";
         default: break;
         }
     } else if (impl == 0x51) { /* Qualcomm */
         return "Qualcomm Kryo/Oryon ARM64";
     } else if (impl == 0x4e) { /* NVIDIA */
-        return "NVIDIA Carmel/Grace ARM64";
+        return "NVIDIA Denver/Carmel ARM64"; /* Grace and GB10 report ARM Ltd (0x41) cores */
     }
     return NULL;
 }

@@ -5,6 +5,7 @@
 #include <android/log.h>
 #include <android/native_window_jni.h>
 #include <jni.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,8 +17,18 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "winvm-jni", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "winvm-jni", __VA_ARGS__)
 
+/* g_op_mu serializes whole start/stop operations (held for seconds: never taken on the UI thread).
+   g_life_mu is short: it guards g_surface_win and the moment the VM's display may be handed to the
+   renderer, so a surface callback can't pass a board->fb that a concurrent stop is about to free. */
+static pthread_mutex_t g_op_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_life_mu = PTHREAD_MUTEX_INITIALIZER;
 static ANativeWindow *g_surface_win = NULL;
 static atomic_int g_vm_running = 0;
+static int g_display_live = 0; /* under g_life_mu: board.fb is valid to show */
+
+static const char *get_utf(JNIEnv *env, jstring s) {
+    return s ? (*env)->GetStringUTFChars(env, s, NULL) : NULL; /* NULL on OOM too (exception pending) */
+}
 
 static void on_vm_exit(int reason) {
     LOGI("VM exited with reason=%d (%s)", reason, hv_winvm_reason_name(reason));
@@ -32,18 +43,23 @@ Java_com_winpixel_app_WinVmBridge_nativeStartVm(
     jstring j_share_dir, jstring j_share_sock,
     jint cpus, jint ram_mb, jboolean sound, jboolean no_net) {
     (void)clazz;
+    pthread_mutex_lock(&g_op_mu);
     if (atomic_load(&g_vm_running)) {
+        pthread_mutex_unlock(&g_op_mu);
         return (*env)->NewStringUTF(env, "VM is already running.");
     }
     /* Clean up any previous VM instance that exited on its own before recreating. */
+    pthread_mutex_lock(&g_life_mu);
+    g_display_live = 0;
+    pthread_mutex_unlock(&g_life_mu);
     hv_winvm_destroy();
 
-    const char *code_fd = j_code_fd ? (*env)->GetStringUTFChars(env, j_code_fd, NULL) : NULL;
-    const char *vars_fd = j_vars_fd ? (*env)->GetStringUTFChars(env, j_vars_fd, NULL) : NULL;
-    const char *disk0 = j_disk0 ? (*env)->GetStringUTFChars(env, j_disk0, NULL) : NULL;
-    const char *disk1 = j_disk1 ? (*env)->GetStringUTFChars(env, j_disk1, NULL) : NULL;
-    const char *share_dir = j_share_dir ? (*env)->GetStringUTFChars(env, j_share_dir, NULL) : NULL;
-    const char *share_sock = j_share_sock ? (*env)->GetStringUTFChars(env, j_share_sock, NULL) : NULL;
+    const char *code_fd = get_utf(env, j_code_fd);
+    const char *vars_fd = get_utf(env, j_vars_fd);
+    const char *disk0 = get_utf(env, j_disk0);
+    const char *disk1 = get_utf(env, j_disk1);
+    const char *share_dir = get_utf(env, j_share_dir);
+    const char *share_sock = get_utf(env, j_share_sock);
 
     HvWinVmConfig cfg;
     memset(&cfg, 0, sizeof cfg);
@@ -70,17 +86,19 @@ Java_com_winpixel_app_WinVmBridge_nativeStartVm(
     if (share_sock) (*env)->ReleaseStringUTFChars(env, j_share_sock, share_sock);
 
     if (rc != 0) {
+        pthread_mutex_unlock(&g_op_mu);
         LOGE("hv_winvm_create failed: %s", err);
         return (*env)->NewStringUTF(env, err[0] ? err : "hv_winvm_create failed");
     }
 
+    pthread_mutex_lock(&g_life_mu);
     HvWinVirt *b = hv_winvm_board();
-    if (b && b->fb && g_surface_win) {
-        hv_fb_android_set_window(b->fb, g_surface_win);
-    }
-
+    g_display_live = 1;
+    if (b && b->fb && g_surface_win) hv_fb_android_set_window(b->fb, g_surface_win);
     atomic_store(&g_vm_running, 1);
+    pthread_mutex_unlock(&g_life_mu);
     hv_winvm_start(1, on_vm_exit);
+    pthread_mutex_unlock(&g_op_mu);
     LOGI("VM started (%d vCPUs, %llu MB RAM)", cfg.ncpus, (unsigned long long)cfg.ram_mb);
     return NULL;
 }
@@ -89,8 +107,13 @@ JNIEXPORT void JNICALL
 Java_com_winpixel_app_WinVmBridge_nativeStopVm(JNIEnv *env, jclass clazz) {
     (void)env;
     (void)clazz;
-    hv_winvm_destroy();
+    pthread_mutex_lock(&g_op_mu); /* a second Stop waits, then finds nothing to destroy */
+    pthread_mutex_lock(&g_life_mu);
+    g_display_live = 0;
     atomic_store(&g_vm_running, 0);
+    pthread_mutex_unlock(&g_life_mu);
+    hv_winvm_destroy();
+    pthread_mutex_unlock(&g_op_mu);
 }
 
 JNIEXPORT void JNICALL
@@ -103,6 +126,7 @@ Java_com_winpixel_app_WinVmBridge_nativePowerButton(JNIEnv *env, jclass clazz) {
 JNIEXPORT void JNICALL
 Java_com_winpixel_app_WinVmBridge_nativeSetSurface(JNIEnv *env, jclass clazz, jobject surface) {
     (void)clazz;
+    pthread_mutex_lock(&g_life_mu);
     if (g_surface_win) {
         ANativeWindow_release(g_surface_win);
         g_surface_win = NULL;
@@ -110,8 +134,9 @@ Java_com_winpixel_app_WinVmBridge_nativeSetSurface(JNIEnv *env, jclass clazz, jo
     if (surface) {
         g_surface_win = ANativeWindow_fromSurface(env, surface);
     }
-    HvWinVirt *b = hv_winvm_board();
+    HvWinVirt *b = g_display_live ? hv_winvm_board() : NULL;
     hv_fb_android_set_window(b ? b->fb : NULL, g_surface_win);
+    pthread_mutex_unlock(&g_life_mu);
 }
 
 JNIEXPORT void JNICALL

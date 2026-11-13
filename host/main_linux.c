@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "winvm.h"
@@ -21,11 +23,60 @@
 #include "share.h"
 
 static volatile sig_atomic_t g_sig_stop = 0;
+static struct in_addr g_listen_addr; /* --listen: where the web viewer and VNC server bind (default 127.0.0.1) */
 
-static void on_sig(int sig) {
-    (void)sig;
-    g_sig_stop = 1;
-    hv_winvm_stop();
+/* SIGINT/SIGTERM are blocked in every thread and taken here with sigwait(): hv_winvm_stop() takes
+   mutexes and signals condition variables, which is not safe from an asynchronous signal handler
+   (a handler interrupting a CPU thread that holds its wake_mu would deadlock). A second signal
+   exits at once. */
+static void *signal_thread(void *arg) {
+    sigset_t *set = (sigset_t *)arg;
+    for (int count = 0;; count++) {
+        int sig = 0;
+        if (sigwait(set, &sig) != 0) continue;
+        if (count) {
+            fprintf(stderr, "\nwinvm: second signal — exiting immediately\n");
+            _exit(130);
+        }
+        g_sig_stop = 1;
+        hv_winvm_stop();
+    }
+    return NULL;
+}
+
+/* A client that connects and then stalls must not wedge a server thread forever. */
+static void set_sock_timeouts(int fd, int sec) {
+    struct timeval tv = {.tv_sec = sec, .tv_usec = 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
+
+static int listen_tcp(int port, int backlog, const char *what) {
+    int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) return -1;
+    int on = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons((uint16_t)port),
+        .sin_addr = g_listen_addr,
+    };
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &g_listen_addr, ip, sizeof ip);
+    if (bind(s, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(s, backlog) != 0) {
+        fprintf(stderr, "winvm: could not bind %s on %s:%d: %s\n", what, ip, port, strerror(errno));
+        close(s);
+        return -1;
+    }
+    fprintf(stderr, "winvm: %s listening on %s:%d%s\n", what, ip, port,
+            g_listen_addr.s_addr == htonl(INADDR_LOOPBACK) ? "" : " (WARNING: no authentication — anyone who can reach this address controls the VM)");
+    return s;
+}
+
+static int accept_retry(int s) {
+    int c = accept4(s, NULL, NULL, SOCK_CLOEXEC);
+    if (c < 0 && errno != EINTR && errno != ECONNABORTED) usleep(100000); /* EMFILE etc.: don't spin */
+    return c;
 }
 
 /* Simple ASCII typer using USB HID Keyboard usages */
@@ -398,28 +449,25 @@ static void handle_web_client(int fd) {
     close(fd);
 }
 
+static void *web_client_thread(void *arg) {
+    handle_web_client((int)(intptr_t)arg);
+    return NULL;
+}
+
 static void *web_server_thread(void *arg) {
     int port = (int)(intptr_t)arg;
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int s = listen_tcp(port, 32, "interactive web viewer (HTTP)");
     if (s < 0) return NULL;
     int on = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons((uint16_t)port),
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-    };
-    if (bind(s, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(s, 32) != 0) {
-        fprintf(stderr, "winvm: could not bind web viewer on port %d: %s\n", port, strerror(errno));
-        close(s);
-        return NULL;
-    }
-    fprintf(stderr, "winvm: interactive web viewer listening on http://127.0.0.1:%d/\n", port);
     while (!g_sig_stop) {
-        int c = accept(s, NULL, NULL);
+        int c = accept_retry(s);
         if (c < 0) continue;
         setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
-        handle_web_client(c);
+        set_sock_timeouts(c, 10);
+        /* Per connection, so one slow client (or a keyboard macro's sleeps) doesn't stall frames for everyone. */
+        pthread_t t;
+        if (pthread_create(&t, NULL, web_client_thread, (void *)(intptr_t)c) == 0) pthread_detach(t);
+        else close(c);
     }
     close(s);
     return NULL;
@@ -486,9 +534,42 @@ static uint8_t keysym_to_hid(uint32_t ks) {
     }
 }
 
+/* The client's pixel format (SetPixelFormat). Defaults to what ServerInit announces: 32 bpp
+   little-endian XRGB, which is the ramfb's BGRX8888 byte order and is sent untouched. */
+typedef struct VncPixfmt {
+    uint8_t bpp, big_endian, true_color;
+    uint16_t rmax, gmax, bmax;
+    uint8_t rshift, gshift, bshift;
+} VncPixfmt;
+
+static int pixfmt_is_native(const VncPixfmt *f) {
+    return f->bpp == 32 && !f->big_endian && f->rmax == 255 && f->gmax == 255 && f->bmax == 255 &&
+           f->rshift == 16 && f->gshift == 8 && f->bshift == 0;
+}
+
+/* One BGRX row into the client's format; out holds w * bpp/8 bytes. */
+static void convert_row(const VncPixfmt *f, const uint8_t *src, uint8_t *out, uint32_t w) {
+    unsigned bytes = f->bpp / 8;
+    for (uint32_t x = 0; x < w; x++) {
+        uint32_t b = src[x * 4 + 0], g = src[x * 4 + 1], r = src[x * 4 + 2];
+        uint32_t v = ((r * f->rmax + 127) / 255) << f->rshift | ((g * f->gmax + 127) / 255) << f->gshift |
+                     ((b * f->bmax + 127) / 255) << f->bshift;
+        uint8_t *o = out + (size_t)x * bytes;
+        for (unsigned i = 0; i < bytes; i++) o[i] = (uint8_t)(f->big_endian ? v >> (8 * (bytes - 1 - i)) : v >> (8 * i));
+    }
+}
+
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
 static void *vnc_client_thread(void *arg) {
     int fd = (int)(intptr_t)arg;
+    uint8_t *rowbuf = NULL;
     char ver[12];
+    set_sock_timeouts(fd, 30); /* handshake; relaxed below once the session is up */
     if (send_bytes(fd, "RFB 003.008\n", 12) != 0 || recv_exact(fd, ver, 12) != 0) goto out;
     uint8_t sec_offer[2] = {1, 1}; /* 1 security type: None (1) */
     uint8_t sec_choice = 0, shared = 0;
@@ -496,15 +577,27 @@ static void *vnc_client_thread(void *arg) {
     if (send_bytes(fd, sec_offer, 2) != 0 || recv_exact(fd, &sec_choice, 1) != 0 ||
         send_bytes(fd, &sec_ok, 4) != 0 || recv_exact(fd, &shared, 1) != 0)
         goto out;
+    /* An idle viewer can go quiet for a long time; only sends need a bound now. */
+    {
+        struct timeval none = {0}, snd = {.tv_sec = 30};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof none);
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof snd);
+    }
 
-    uint32_t cur_w = 1024, cur_h = 768;
-    hv_winvm_display_size(&cur_w, &cur_h);
-    if (cur_w == 0 || cur_h == 0) { cur_w = 1024; cur_h = 768; }
+    /* cli_w x cli_h: the framebuffer size the client believes in (ServerInit, then DesktopSize).
+       Without DesktopSize support it never changes, and a differently sized guest frame is clipped. */
+    uint32_t cli_w = 1024, cli_h = 768;
+    hv_winvm_display_size(&cli_w, &cli_h);
+    if (cli_w == 0 || cli_h == 0) { cli_w = 1024; cli_h = 768; }
+    if (cli_w > 4096) cli_w = 4096;
+    if (cli_h > 4096) cli_h = 4096;
     int supports_desktop_size = 0;
+    VncPixfmt fmt = {32, 0, 1, 255, 255, 255, 16, 8, 0};
+    uint64_t last_frame_ms = 0;
 
     uint8_t init_msg[24 + 12] = {
-        (uint8_t)(cur_w >> 8), (uint8_t)cur_w,
-        (uint8_t)(cur_h >> 8), (uint8_t)cur_h,
+        (uint8_t)(cli_w >> 8), (uint8_t)cli_w,
+        (uint8_t)(cli_h >> 8), (uint8_t)cli_h,
         32, 24, 0, 1, /* 32 bpp, depth 24, little-endian, true-color */
         0, 255, 0, 255, 0, 255, /* r/g/b max = 255 */
         16, 8, 0,               /* r_shift=16, g_shift=8, b_shift=0 (matches BGRX8888!) */
@@ -513,13 +606,25 @@ static void *vnc_client_thread(void *arg) {
         'W','i','n','d','o','w','s','P','i','x','e','l'
     };
     if (send_bytes(fd, init_msg, sizeof init_msg) != 0) goto out;
+    rowbuf = malloc(4096 * 4);
+    if (!rowbuf) goto out;
 
     while (!g_sig_stop) {
         uint8_t msg_type = 0;
         if (recv_exact(fd, &msg_type, 1) != 0) break;
         if (msg_type == 0) { /* SetPixelFormat */
-            uint8_t skip[19];
-            if (recv_exact(fd, skip, 19) != 0) break;
+            uint8_t pf[19];
+            if (recv_exact(fd, pf, 19) != 0) break;
+            const uint8_t *p = pf + 3; /* 3 bytes padding */
+            VncPixfmt nf = {p[0], p[2] != 0, p[3] != 0, (uint16_t)(p[4] << 8 | p[5]), (uint16_t)(p[6] << 8 | p[7]),
+                            (uint16_t)(p[8] << 8 | p[9]), p[10], p[11], p[12]};
+            if (!nf.true_color || (nf.bpp != 8 && nf.bpp != 16 && nf.bpp != 32) || nf.rshift >= nf.bpp ||
+                nf.gshift >= nf.bpp || nf.bshift >= nf.bpp) {
+                fprintf(stderr, "winvm: VNC client asked for an unsupported pixel format (%u bpp, true-color %u); closing\n",
+                        nf.bpp, nf.true_color);
+                break;
+            }
+            fmt = nf;
         } else if (msg_type == 2) { /* SetEncodings */
             uint8_t hdr[3];
             if (recv_exact(fd, hdr, 3) != 0) break;
@@ -534,43 +639,53 @@ static void *vnc_client_thread(void *arg) {
         } else if (msg_type == 3) { /* FramebufferUpdateRequest */
             uint8_t req[9];
             if (recv_exact(fd, req, 9) != 0) break;
+            /* Every update is a full raw frame, so pace incremental requests (~30 fps) instead of
+               streaming frames as fast as the client can ask. */
+            if (req[0]) {
+                uint64_t now = now_ms();
+                if (now - last_frame_ms < 33) usleep((useconds_t)(33 - (now - last_frame_ms)) * 1000u);
+            }
             HvWinVirt *board = hv_winvm_board();
             const uint8_t *px = NULL;
             uint32_t fw = 0, fh = 0, st = 0;
-            uint32_t prev_w = cur_w, prev_h = cur_h;
-            if (board && board->fb && hv_fb_display_get_frame(board->fb, &px, &fw, &fh, &st) == 0) {
-                if (supports_desktop_size || (fw <= prev_w && fh <= prev_h)) {
-                    cur_w = fw;
-                    cur_h = fh;
-                }
-            }
-            uint16_t w = (uint16_t)(cur_w > 4096 ? 4096 : cur_w);
-            uint16_t h = (uint16_t)(cur_h > 4096 ? 4096 : cur_h);
-            if (supports_desktop_size && (cur_w != prev_w || cur_h != prev_h)) {
+            if (!board || !board->fb || hv_fb_display_get_frame(board->fb, &px, &fw, &fh, &st) != 0) px = NULL;
+            if (px && supports_desktop_size && (fw != cli_w || fh != cli_h) && fw <= 4096 && fh <= 4096) {
+                cli_w = fw;
+                cli_h = fh;
                 uint8_t ds[16] = {
                     0, 0, 0, 1, /* FramebufferUpdate, 1 DesktopSize rectangle */
-                    0, 0, 0, 0, (uint8_t)(w >> 8), (uint8_t)w, (uint8_t)(h >> 8), (uint8_t)h,
+                    0, 0, 0, 0, (uint8_t)(cli_w >> 8), (uint8_t)cli_w, (uint8_t)(cli_h >> 8), (uint8_t)cli_h,
                     0xff, 0xff, 0xff, 0x21 /* -223 = DesktopSize */
                 };
                 if (send_bytes(fd, ds, 16) != 0) break;
             }
+            /* Never read past the guest frame: the rectangle is the overlap of both sizes, the rest
+               of the client's framebuffer (if the guest shrank) is sent black. */
+            uint32_t w = cli_w, h = cli_h;
+            uint32_t cw = px ? (fw < w ? fw : w) : 0, ch = px ? (fh < h ? fh : h) : 0;
             uint8_t fbu[16] = {
                 0, 0, 0, 1, /* Msg 0 (FramebufferUpdate), 1 rectangle */
                 0, 0, 0, 0, (uint8_t)(w >> 8), (uint8_t)w, (uint8_t)(h >> 8), (uint8_t)h,
                 0, 0, 0, 0  /* Encoding 0 (Raw) */
             };
             if (send_bytes(fd, fbu, 16) != 0) break;
-            if (px) {
-                for (uint16_t y = 0; y < h; y++) {
-                    if (send_bytes(fd, px + (size_t)y * st, (size_t)w * 4) != 0) goto out;
+            size_t out_row = (size_t)w * (fmt.bpp / 8);
+            int native = pixfmt_is_native(&fmt);
+            for (uint32_t y = 0; y < h; y++) {
+                const uint8_t *row;
+                if (y < ch && native && cw == w) {
+                    row = px + (size_t)y * st;
+                } else {
+                    memset(rowbuf, 0, out_row);
+                    if (y < ch) {
+                        if (native) memcpy(rowbuf, px + (size_t)y * st, (size_t)cw * 4);
+                        else convert_row(&fmt, px + (size_t)y * st, rowbuf, cw);
+                    }
+                    row = rowbuf;
                 }
-            } else {
-                uint8_t *zero = calloc(w, 4);
-                for (uint16_t y = 0; y < h; y++) {
-                    if (send_bytes(fd, zero, (size_t)w * 4) != 0) { free(zero); goto out; }
-                }
-                free(zero);
+                if (send_bytes(fd, row, out_row) != 0) goto out;
             }
+            last_frame_ms = now_ms();
         } else if (msg_type == 4) { /* KeyEvent */
             uint8_t kev[7];
             if (recv_exact(fd, kev, 7) != 0) break;
@@ -585,9 +700,12 @@ static void *vnc_client_thread(void *arg) {
             uint16_t px_y = (uint16_t)((pev[3] << 8) | pev[4]);
             uint8_t btns = (bmask & 1) | ((bmask & 4) ? 2 : 0) | ((bmask & 2) ? 4 : 0);
             int8_t wheel = (bmask & 8) ? 1 : (bmask & 16) ? -1 : 0;
-            double xn = cur_w ? (double)px_x / (double)cur_w : 0.0;
-            double yn = cur_h ? (double)px_y / (double)cur_h : 0.0;
-            hv_winvm_tablet(xn, yn, btns, wheel);
+            /* Client pixels map 1:1 onto guest pixels (clipped, not scaled): normalize by the guest frame. */
+            uint32_t gw = cli_w, gh = cli_h;
+            hv_winvm_display_size(&gw, &gh);
+            if (!gw || !gh) { gw = cli_w; gh = cli_h; }
+            double xn = (double)px_x / (double)gw, yn = (double)px_y / (double)gh;
+            hv_winvm_tablet(xn > 1 ? 1 : xn, yn > 1 ? 1 : yn, btns, wheel);
         } else if (msg_type == 6) { /* ClientCutText */
             uint8_t hdr[7];
             if (recv_exact(fd, hdr, 7) != 0) break;
@@ -598,32 +716,25 @@ static void *vnc_client_thread(void *arg) {
             cut[len] = 0;
             hv_share_set_clipboard(cut);
             free(cut);
+        } else {
+            /* Unknown message: its length is unknown too, so the stream can't be resynchronized. */
+            fprintf(stderr, "winvm: VNC client sent unsupported message type %u; closing\n", msg_type);
+            break;
         }
     }
 out:
+    free(rowbuf);
     close(fd);
     return NULL;
 }
 
 static void *vnc_server_thread(void *arg) {
     int port = (int)(intptr_t)arg;
-    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int s = listen_tcp(port, 8, "VNC server (RFB 3.8)");
     if (s < 0) return NULL;
     int on = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons((uint16_t)port),
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-    };
-    if (bind(s, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(s, 8) != 0) {
-        fprintf(stderr, "winvm: could not bind VNC server on port %d: %s\n", port, strerror(errno));
-        close(s);
-        return NULL;
-    }
-    fprintf(stderr, "winvm: VNC server listening on 127.0.0.1:%d\n", port);
     while (!g_sig_stop) {
-        int c = accept(s, NULL, NULL);
+        int c = accept_retry(s);
         if (c < 0) continue;
         setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on);
         pthread_t ct;
@@ -646,6 +757,8 @@ static void usage(const char *prog) {
             "  --share <dir>             Host folder shared at http://10.0.2.4/\n"
             "  --web <port>              Start interactive HTTP/Canvas viewer (default: 8080 unless --headless)\n"
             "  --vnc <port>              Start RFB 3.8 VNC server on port (e.g. 5900)\n"
+            "  --listen <ipv4>           Address the web viewer and VNC bind to (default: 127.0.0.1;\n"
+            "                            use 0.0.0.0 to expose them, unauthenticated, to the network)\n"
             "  --headless                Run without web viewer\n"
             "  --screenshot <png>        Save guest framebuffer PNG\n"
             "  --screenshot-after <sec>  Save screenshot after N seconds\n"
@@ -671,6 +784,7 @@ int main(int argc, char **argv) {
     TimerArgs targs = {NULL, 0, 0};
     const char *cmd_file = getenv("HV_INPUT_FILE");
     char share_sock_buf[512] = {0};
+    g_listen_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--headless")) { headless = 1; continue; }
@@ -688,6 +802,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--share"))        cfg.share_dir = argv[++i];
         else if (!strcmp(argv[i], "--web"))          web_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--vnc"))          vnc_port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--listen")) {
+            if (inet_pton(AF_INET, argv[++i], &g_listen_addr) != 1) {
+                fprintf(stderr, "winvm: --listen expects an IPv4 address, got '%s'\n", argv[i]);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--screenshot"))   targs.screenshot_path = argv[++i];
         else if (!strcmp(argv[i], "--screenshot-after")) targs.screenshot_after = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--timeout"))      targs.timeout_sec = atoi(argv[++i]);
@@ -705,14 +825,22 @@ int main(int argc, char **argv) {
         cfg.share_sock = share_sock_buf;
     }
 
+    /* Block SIGINT/SIGTERM before any thread exists so every thread inherits the mask; see signal_thread. */
+    static sigset_t stop_set;
+    sigemptyset(&stop_set);
+    sigaddset(&stop_set, SIGINT);
+    sigaddset(&stop_set, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &stop_set, NULL);
+    {
+        pthread_t st;
+        if (pthread_create(&st, NULL, signal_thread, &stop_set) == 0) pthread_detach(st);
+    }
+
     char err[256] = {0};
     if (hv_winvm_create(&cfg, err, sizeof err) != 0) {
         fprintf(stderr, "winvm: failed to create VM: %s\n", err);
         return 1;
     }
-
-    signal(SIGINT, on_sig);
-    signal(SIGTERM, on_sig);
 
     if (targs.screenshot_path || targs.timeout_sec > 0) {
         pthread_t tt;

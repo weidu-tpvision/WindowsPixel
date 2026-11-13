@@ -7,6 +7,7 @@ CPUS="${CPUS:-4}"
 RAM="${RAM:-4608}"
 WEB_PORT="${WEB_PORT:-8080}"
 VNC_PORT="${VNC_PORT:-5900}"
+LISTEN="${LISTEN:-127.0.0.1}"
 
 DISK1=""
 EXTRA_ARGS=()
@@ -23,7 +24,9 @@ Options:
   -h, --help      Show this help message
 
 Environment overrides:
-  CPUS=$CPUS  RAM=$RAM  WEB_PORT=$WEB_PORT  VNC_PORT=$VNC_PORT
+  CPUS=$CPUS  RAM=$RAM  WEB_PORT=$WEB_PORT  VNC_PORT=$VNC_PORT  LISTEN=$LISTEN
+  (the web viewer and VNC have no authentication: keep LISTEN=127.0.0.1 and use
+   ssh -L, or set LISTEN=0.0.0.0 only on a trusted network)
 
 Any other flags are passed directly to build/winvm (e.g. --headless, --share ~/shared).
 EOF
@@ -76,6 +79,7 @@ CMD=(
   --ram "$RAM"
   --web "$WEB_PORT"
   --vnc "$VNC_PORT"
+  --listen "$LISTEN"
 )
 
 if [[ -n "$DISK1" ]]; then
