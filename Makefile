@@ -141,7 +141,7 @@ ANDROID_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -fPIC -D_GNU_SOURCE -DHAVE_SLIRP=
 AB = build/android
 
 ANDROID_C_SRC = $(wildcard core/*.c) \
-                host/jit_region.c host/disk.c host/winvm.c host/net_slirp.c host/share.c host/hvsparse.c \
+                host/jit_region.c host/disk.c host/winvm.c host/net_slirp.c host/share.c host/hvsparse.c host/audio_android.c \
                 $(wildcard devices/*.c) \
                 $(wildcard third_party/libslirp/*.c)
 ANDROID_OBJ = $(patsubst %.c,$(AB)/%.o,$(ANDROID_C_SRC)) $(AB)/host/enter.o
@@ -162,9 +162,11 @@ $(AB)/libwinvm.a: $(ANDROID_OBJ)
 	rm -f $@
 	$(ANDROID_AR) rcs $@ $(ANDROID_OBJ)
 $(AB)/libwinvm.so: $(ANDROID_OBJ)
-	$(ANDROID_CC) -shared -o $@ $(ANDROID_OBJ) -llog -lm
+	$(ANDROID_CC) -shared -o $@ $(ANDROID_OBJ) -lEGL -lGLESv3 -landroid -laaudio -llog -lm
+$(AB)/libwinvm_jni.so: android/app/src/main/cpp/winvm_jni.c $(AB)/libwinvm.a
+	$(ANDROID_CC) -std=c11 -Wall -Wextra -O2 -g -fPIC -D_GNU_SOURCE -Icore -Ihost -Idevices -shared $< $(AB)/libwinvm.a -lEGL -lGLESv3 -landroid -laaudio -llog -lm -o $@
 
-android-lib: $(AB)/libwinvm.a $(AB)/libwinvm.so
+android-lib: $(AB)/libwinvm.a $(AB)/libwinvm.so $(AB)/libwinvm_jni.so
 
 clean:
 	rm -rf $(B)

@@ -169,9 +169,9 @@ flowchart LR
 | **Build System (`Makefile`, `CMakeLists.txt`)** | **Done & Verified** | Complete | Native Linux ARM64 + Android API 34 (`libwinvm.so` / `.a`) |
 | **Stage A: `spark-20aa` Runner (`main_linux.c`)** | **Done & Verified** | Complete | `host/main_linux.c` (CLI + Web Canvas + VNC + PNG export) |
 | **Networking (`third_party/libslirp`)** | **Done & Verified** | Complete | Vendored `libslirp` v4.8.0 + `glib.h` shim (Linux + Android) |
-| **Stage B: Display (Vulkan/GLES `ANativeWindow`)** | **Next (Phase 3)** | 3–5 days | Replace `fb_metal.m` with `ANativeWindow` `BGRX8888` blitter |
-| **Stage B: Audio (Google Oboe `audio_android.cpp`)** | **Next (Phase 3)** | 2–3 days | Drop-in replacement for `audio_mac.c` (`hv_audio_attach_hda`) |
-| **Stage B: Android UI, JNI & Chrome Custom Tabs** | **Next (Phase 4)** | 3–5 days | Jetpack Compose UI, SurfaceView, JNI glue, OAuth bridge |
+| **Stage B: Display (`ANativeWindow` + GLES 3.0)** | **Implemented & Linked** | Ready for Device Test | `devices/fb_android.c` (hardware `BGRX8888` texture swizzle) |
+| **Stage B: Audio (AAudio `audio_android.c`)** | **Implemented & Linked** | Ready for Device Test | `host/audio_android.c` (48 kHz S16LE full-duplex playback + mic) |
+| **Stage B: Android UI, JNI & Chrome Custom Tabs** | **Implemented & Linked** | Ready for APK Build | `android/` Compose UI, `VmForegroundService`, `winvm_jni.c` |
 
 ---
 

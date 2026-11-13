@@ -4,6 +4,11 @@ work/
 ios/deps/
 ios/*.xcodeproj
 ios/DerivedData/
+android/local.properties
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
 
 # App bundles & object archives
 *.ipa

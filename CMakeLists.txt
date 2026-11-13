@@ -81,6 +81,11 @@ file(GLOB SLIRP_SRCS "third_party/libslirp/*.c")
 set_source_files_properties(${SLIRP_SRCS} PROPERTIES COMPILE_FLAGS "-Wno-unused-parameter -Wno-sign-compare -Wno-unused-variable")
 list(APPEND VM_HOST_SRCS ${SLIRP_SRCS})
 
+if(ANDROID)
+    list(APPEND DEVICE_SRCS devices/fb_android.c)
+    list(APPEND VM_HOST_SRCS host/audio_android.c)
+endif()
+
 # CRITICAL: hv_tlb_refill runs while guest SIMD/FP registers v0..v31 are live
 # in host hardware registers. Prevent the compiler from touching v0..v31.
 set_source_files_properties(core/mmu.c PROPERTIES COMPILE_FLAGS "-mgeneral-regs-only")
@@ -103,7 +108,12 @@ set_target_properties(winvm_static PROPERTIES OUTPUT_NAME winvm)
 
 if(ANDROID)
     find_library(log-lib log)
-    target_link_libraries(winvm PRIVATE ${log-lib} m)
+    find_library(android-lib android)
+    find_library(egl-lib EGL)
+    find_library(gles3-lib GLESv3)
+    find_library(aaudio-lib aaudio)
+    target_link_libraries(winvm PRIVATE ${egl-lib} ${gles3-lib} ${android-lib} ${aaudio-lib} ${log-lib} m)
+    target_link_libraries(winvm_static INTERFACE ${egl-lib} ${gles3-lib} ${android-lib} ${aaudio-lib} ${log-lib} m)
 else()
     target_link_libraries(winvm PRIVATE pthread m)
 endif()

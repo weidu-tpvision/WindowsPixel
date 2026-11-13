@@ -38,4 +38,11 @@ void hv_fb_metal_set_layer(HvFbDisplay *fb, void *ca_metal_layer);
 uint64_t hv_fb_metal_frames(HvFbDisplay *fb);
 int hv_fb_save_png(HvFbDisplay *fb, const char *path);
 
+#ifdef __ANDROID__
+struct ANativeWindow;
+void hv_fb_android_set_window(HvFbDisplay *fb, struct ANativeWindow *win);
+uint64_t hv_fb_android_frames(void);
+void hv_fb_android_shutdown(void);
+#endif
+
 #endif

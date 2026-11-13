@@ -9,9 +9,11 @@
 #include <TargetConditionals.h>
 #include <os/lock.h>
 #include <pthread/qos.h>
-#include "audio_mac.h"
 #else
 #include <sched.h>
+#endif
+#if defined(__APPLE__) || defined(__ANDROID__)
+#include "audio_mac.h"
 #endif
 #include <pthread.h>
 #include <signal.h>
@@ -239,7 +241,7 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
         if (hv_net_attach(&m, board.net) == 0) net_on = 1;
         else fprintf(stderr, "winvm: user-mode SLIRP networking unavailable\n");
     }
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__ANDROID__)
     if (board.hda && c->enable_sound) hv_audio_attach_hda(board.hda);
 #endif
     board.poll = board_poll;
@@ -382,8 +384,11 @@ void hv_winvm_start(int spawn_cpu0, void (*on_exit)(int reason)) {
 
 void hv_winvm_stop(void) {
     atomic_store(&stop_requested, 1);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__ANDROID__)
     hv_audio_shutdown();
+#endif
+#ifdef __ANDROID__
+    hv_fb_android_shutdown();
 #endif
     for (int i = 0; i < ncpus; i++) cpus[i].halted = 3;
     hv_machine_kick_all(&m);
