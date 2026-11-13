@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 typedef struct {
     uint8_t *buf;
@@ -710,8 +713,139 @@ static size_t build_iort(Buf *tabs) {
     return start;
 }
 
+static void b_str(Buf *b, const char *s) {
+    b_put(b, s, strlen(s) + 1);
+}
+
+#if !defined(__APPLE__) && !defined(__ANDROID__)
+static int read_sys_str(const char *path, char *out, size_t cap) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    size_t n = fread(out, 1, cap - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r' || out[n - 1] == ' ' || out[n - 1] == '\0'))
+        out[--n] = '\0';
+    return n > 0;
+}
+
+static const char *lookup_arm_cpu_name(unsigned impl, unsigned part) {
+    if (impl == 0x41) { /* ARM Ltd */
+        switch (part) {
+        case 0xd05: return "ARM Cortex-A55";
+        case 0xd07: return "ARM Cortex-A57";
+        case 0xd08: return "ARM Cortex-A72";
+        case 0xd09: return "ARM Cortex-A73";
+        case 0xd0a: return "ARM Cortex-A75";
+        case 0xd0b: return "ARM Cortex-A76";
+        case 0xd0c: return "ARM Neoverse N1";
+        case 0xd0d: return "ARM Cortex-A77";
+        case 0xd40: return "ARM Neoverse V1";
+        case 0xd41: return "ARM Cortex-A78";
+        case 0xd44: return "ARM Cortex-X1";
+        case 0xd46: return "ARM Cortex-A510";
+        case 0xd47: return "ARM Cortex-A710";
+        case 0xd48: return "ARM Cortex-X2";
+        case 0xd49: return "ARM Neoverse N2";
+        case 0xd4d: return "ARM Cortex-A715";
+        case 0xd4e: return "ARM Cortex-X3";
+        case 0xd4f: return "ARM Neoverse V2";
+        case 0xd80: return "ARM Cortex-A520";
+        case 0xd81: return "ARM Cortex-A720";
+        case 0xd82: return "ARM Cortex-X4";
+        case 0xd85:
+        case 0xd87: return "ARM Cortex-X925";
+        default: break;
+        }
+    } else if (impl == 0x51) { /* Qualcomm */
+        return "Qualcomm Kryo/Oryon ARM64";
+    } else if (impl == 0x4e) { /* NVIDIA */
+        return "NVIDIA Carmel/Grace ARM64";
+    }
+    return NULL;
+}
+
+static void detect_linux_cpu(char *out, size_t cap) {
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    unsigned impl = 0, part = 0;
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof line, f)) {
+            unsigned v = 0;
+            if (sscanf(line, "CPU implementer : %x", &v) == 1) impl = v;
+            else if (sscanf(line, "CPU part : %x", &v) == 1) part = v;
+            if (impl && part) break;
+        }
+        fclose(f);
+    }
+    const char *name = lookup_arm_cpu_name(impl, part);
+    if (name) {
+        snprintf(out, cap, "%s", name);
+    } else if (impl || part) {
+        snprintf(out, cap, "ARM64 (0x%02x:0x%03x)", impl, part);
+    } else {
+        snprintf(out, cap, "Linux ARM64");
+    }
+}
+#endif
+
 static void build_smbios(HvFwCfg *fw, int ncpus, uint64_t ram_size) {
     Buf t = {0};
+
+#ifdef __APPLE__
+    const char *sm_mfg = "Apple / WindowsiOS";
+    const char *sm_prod = "iPhone Duo ARM64 PC";
+    const char *sm_serial = "DUO-WIN11-ARM64";
+    const char *sm_family = "WindowsiOS";
+    const char *sm_chas_mfg = "Apple";
+    const char *sm_chas_ver = "iPhone19,4";
+    const char *sm_cpu_mfg = "Apple / ARM";
+    const char *sm_cpu_ver = "Apple A20 Pro (WindowsiOS JIT)";
+#elif defined(__ANDROID__)
+    char vendor[96] = "Google", model[96] = "Pixel", soc[96] = "";
+    char mfg_buf[128], prod_buf[128], cpu_mfg_buf[128], cpu_ver_buf[160];
+    __system_property_get("ro.product.manufacturer", vendor);
+    __system_property_get("ro.product.model", model);
+    if (__system_property_get("ro.soc.model", soc) <= 0 || !soc[0]) {
+        if (__system_property_get("ro.hardware", soc) <= 0 || !soc[0])
+            snprintf(soc, sizeof soc, "ARM64");
+    }
+    snprintf(mfg_buf, sizeof mfg_buf, "%s / WindowsPixel", vendor);
+    snprintf(prod_buf, sizeof prod_buf, "%s ARM64 PC", model);
+    snprintf(cpu_mfg_buf, sizeof cpu_mfg_buf, "%s / ARM", vendor);
+    snprintf(cpu_ver_buf, sizeof cpu_ver_buf, "%s (WindowsPixel JIT)", soc);
+    const char *sm_mfg = mfg_buf;
+    const char *sm_prod = prod_buf;
+    const char *sm_serial = "ANDROID-WIN11-ARM64";
+    const char *sm_family = "WindowsPixel";
+    const char *sm_chas_mfg = vendor;
+    const char *sm_chas_ver = model;
+    const char *sm_cpu_mfg = cpu_mfg_buf;
+    const char *sm_cpu_ver = cpu_ver_buf;
+#else
+    char vendor[96] = "Linux", model[96] = "ARM64 Host", cpu_name[96] = "Linux ARM64";
+    char mfg_buf[128], prod_buf[128], cpu_mfg_buf[128], cpu_ver_buf[160];
+    if (!read_sys_str("/sys/devices/virtual/dmi/id/sys_vendor", vendor, sizeof vendor))
+        read_sys_str("/sys/devices/virtual/dmi/id/board_vendor", vendor, sizeof vendor);
+    if (!read_sys_str("/sys/devices/virtual/dmi/id/product_name", model, sizeof model))
+        read_sys_str("/proc/device-tree/model", model, sizeof model);
+    for (char *p = model; *p; p++) {
+        if (*p == '_') *p = ' ';
+    }
+    detect_linux_cpu(cpu_name, sizeof cpu_name);
+    snprintf(mfg_buf, sizeof mfg_buf, "%s / WindowsPixel", vendor);
+    snprintf(prod_buf, sizeof prod_buf, "%s ARM64 PC", model);
+    snprintf(cpu_mfg_buf, sizeof cpu_mfg_buf, "%s / ARM", vendor);
+    snprintf(cpu_ver_buf, sizeof cpu_ver_buf, "%s (WindowsPixel JIT)", cpu_name);
+    const char *sm_mfg = mfg_buf;
+    const char *sm_prod = prod_buf;
+    const char *sm_serial = "LINUX-WIN11-ARM64";
+    const char *sm_family = "WindowsPixel";
+    const char *sm_chas_mfg = vendor;
+    const char *sm_chas_ver = model;
+    const char *sm_cpu_mfg = cpu_mfg_buf;
+    const char *sm_cpu_ver = cpu_ver_buf;
+#endif
 
     /* Type 1: System Information (len 27) */
     {
@@ -730,11 +864,11 @@ static void build_smbios(HvFwCfg *fw, int ncpus, uint64_t ram_size) {
         b_u8(&t, 6); /* Wake-up Type: Power Switch */
         b_u8(&t, 0); /* SKU */
         b_u8(&t, 5); /* Family */
-        b_put(&t, "Apple / WindowsiOS\0", 19);
-        b_put(&t, "iPhone Duo ARM64 PC\0", 20);
+        b_str(&t, sm_mfg);
+        b_str(&t, sm_prod);
         b_put(&t, "1.0\0", 4);
-        b_put(&t, "DUO-WIN11-ARM64\0", 16);
-        b_put(&t, "WindowsiOS\0", 11);
+        b_str(&t, sm_serial);
+        b_str(&t, sm_family);
         b_u8(&t, 0);
     }
 
@@ -757,8 +891,8 @@ static void build_smbios(HvFwCfg *fw, int ncpus, uint64_t ram_size) {
         b_u8(&t, 0);
         b_u8(&t, 0);
         b_u8(&t, 0);
-        b_put(&t, "Apple\0", 6);
-        b_put(&t, "iPhone19,4\0", 11);
+        b_str(&t, sm_chas_mfg);
+        b_str(&t, sm_chas_ver);
         b_u8(&t, 0);
     }
 
@@ -791,8 +925,8 @@ static void build_smbios(HvFwCfg *fw, int ncpus, uint64_t ram_size) {
         b_u16(&t, 0x0004U);
         b_u16(&t, 0x0101U);
         b_put(&t, "SOC0\0", 5);
-        b_put(&t, "Apple / ARM\0", 12);
-        b_put(&t, "Apple A20 Pro (WindowsiOS JIT)\0", 31);
+        b_str(&t, sm_cpu_mfg);
+        b_str(&t, sm_cpu_ver);
         b_u8(&t, 0);
     }
 

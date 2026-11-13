@@ -231,7 +231,14 @@ dd if=/dev/zero of=work/vars.fd bs=1M count=64 status=none
   --disk work/windows11.img --disk1 work/installer.img \
   --cpus 4 --ram 4608 --web 8080 --vnc 5900
 
-# 4. Boot installed Windows 11 (drop --disk1 and keep vars.fd):
+# 4. (Optional, one-time) Install Red Hat virtio-win NetKVM driver for internet access:
+./build/winvm \
+  --code work/code.fd --vars work/vars.fd \
+  --disk work/windows11.img --disk1 work/virtio_net.img \
+  --cpus 4 --ram 4608 --web 8080 --vnc 5900
+# Inside Windows (Admin terminal): pnputil /add-driver D:\NetKVM\w11\ARM64\*.inf /install
+
+# 5. Boot installed Windows 11 (drop --disk1 and keep vars.fd):
 ./build/winvm \
   --code work/code.fd --vars work/vars.fd \
   --disk work/windows11.img \

@@ -240,7 +240,10 @@ flowchart LR
         ```bash
         ./build/winvm --code work/code.fd --vars work/vars.fd --disk work/windows11.img --cpus 4 --ram 4608 --web 8080 --vnc 5900
         ```
-     4. Open `http://localhost:8080` in your local browser (or connect a VNC viewer to `localhost:5900`).
+     4. **Enable Internet Networking (`virtio-win` `NetKVM` driver):**
+        * `winvm` provides a VirtIO-Net adapter (`1af4:1000`) backed by vendored `libslirp` NAT (`10.0.2.0/24`).
+        * Attach `work/virtio_net.img` (containing Red Hat's WHQL-signed `NetKVM\w11\ARM64` driver) once via `--disk1 work/virtio_net.img`, then in Windows run **Device Manager $\to$ Ethernet Controller $\to$ Update driver** (or `pnputil /add-driver D:\NetKVM\w11\ARM64\*.inf /install` in an Administrator terminal). Future boots without `--disk1` retain full DHCP/NAT internet (`10.0.2.15`).
+     5. Open `http://localhost:8080` in your local browser (or connect a VNC viewer to `localhost:5900`).
 2. **Step 1 (Stage B) — Pixel 9 Display Blitter (`devices/fb_android.c`):**
    * Implement `ANativeWindow` + OpenGL ES 3.0 / Vulkan 120 Hz rendering with hardware `BGRX8888` texture swizzling (`GL_TEXTURE_SWIZZLE_R = GL_BLUE`, `GL_TEXTURE_SWIZZLE_B = GL_RED`).
 3. **Step 2 (Stage B) — Pixel 9 Duplex Audio (`host/audio_android.cpp`):**
