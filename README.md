@@ -149,10 +149,12 @@ dd if=/dev/zero of=work/vars.fd bs=1M count=64 status=none
 # Inside Windows (Admin terminal): pnputil /add-driver D:\NetKVM\w11\ARM64\*.inf /install
 
 # 5. Boot installed Windows 11 (drop --disk1 and keep vars.fd):
-./build/winvm \
-  --code work/code.fd --vars work/vars.fd \
-  --disk work/windows11.img \
-  --cpus 4 --ram 4608 --web 8080 --vnc 5900
+./scripts/launch_spark.sh
+# Equivalent manual command:
+# ./build/winvm \
+#   --code work/code.fd --vars work/vars.fd \
+#   --disk work/windows11.img \
+#   --cpus 8 --ram 8608 --web 8080 --vnc 5900
 ```
 Open **`http://localhost:8080`** in your local browser (or connect a VNC client to `localhost:5900`).
 > **Note on `WINPE` installer drive letters:** If `installer.img` uses a GPT EFI System Partition (`EF00`), WinPE intentionally does not auto-assign it a drive letter (`no ltr`). If `startnet.cmd` stops with `no path found`, run `(echo select volume 2 & echo assign letter=I) | diskpart` and then `X:\Windows\System32\startnet.cmd`.
