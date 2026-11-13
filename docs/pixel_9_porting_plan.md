@@ -208,9 +208,10 @@ flowchart LR
   * `test_mmu` (76 checks, 0 failures)
   * `test_exc` (53 checks, 0 failures — including 24 MHz JIT counter verification)
   * `test_bench`: `1.88x–2.19x` native bare-metal speed across `bench_calls`, `bench_mem`, `bench_dispatch`, and `bench_loop`.
-* **Stage A Standalone Linux Runner (`build/winvm` on `spark-20aa`):**
+* **Stage A Standalone Linux Runner (`build/winvm` on `spark-20aa` — Complete & Verified with Windows 11 ARM64):**
   * Built and verified `./build/winvm` (`host/main_linux.c`) with embedded `libslirp` v4.8.0 (`third_party/libslirp/`), PNG screenshot exporter (`hv_fb_save_png` in `devices/fb_display.c`), interactive HTML5 Canvas web server (`--web 8080`), and RFB 3.8 VNC server (`--vnc 5900`).
-  * Verified end-to-end bare-metal ARM64 guest execution (`pflash` `0x00000000` $\to$ PL011 UART `0x09000000` $\to$ `fw_cfg` DMA `etc/ramfb` configuration $\to$ PNG export $\to$ `PSCI_SYSTEM_OFF`).
+  * Verified end-to-end **Windows 11 ARM64 (Build 26300) WinPE** boot on `spark-20aa` (`code.fd` + fresh zeroed 64 MB `vars.fd` + `--disk work/windows11.img` + `--disk1 work/installer.img` + `--cpus 4 --ram 4608`): EDK2 UEFI booted `Boot0002` NVMe (`WIN11INST`), brought all **4 vCPUs** online in Windows NT (`el1`), and reached the Windows GUI desktop running `startnet.cmd` in under 45 seconds.
+  * *Operational Note:* If UEFI falls back to `>>Start PXE over IPv4.`, `vars.fd` has a stale `BootOrder`; zeroing `vars.fd` (`64 MB`) lets EDK2 auto-discover the NVMe boot partition. (Linux host audio output via ALSA/PulseAudio is optional and currently stubbed on `spark-20aa`.)
 * **Android NDK r27c Cross-Compilation (`make android-lib`):**
   * Compiles all `core/`, `devices/`, `host/`, and `third_party/libslirp/` sources cleanly with `aarch64-linux-android34-clang`, producing `build/android/libwinvm.so` and `build/android/libwinvm.a` with embedded user-mode NAT networking (`-DHAVE_SLIRP=1`).
 
@@ -218,10 +219,11 @@ flowchart LR
 
 ## 6. Next Steps (Stage A Ready $\to$ Stage B: Pixel 9)
 
-1. **Stage A Ready (`spark-20aa` Linux ARM64):**
-   * `./build/winvm` is ready to boot `code.fd`, `vars.fd`, and `windows11.hvsparse` on `spark-20aa`:
+1. **Stage A Complete (`spark-20aa` Linux ARM64):**
+   * `./build/winvm` is verified booting Windows 11 ARM64 on `spark-20aa`. To run unattended Win11 provisioning on `work/windows11.img` or boot an existing disk:
      ```bash
-     ./build/winvm --code /path/to/code.fd --vars /path/to/vars.fd --disk /path/to/windows11.hvsparse --cpus 4 --ram 4608 --web 8080 --vnc 5900
+     dd if=/dev/zero of=work/vars.fd bs=1M count=64 status=none
+     ./build/winvm --code work/code.fd --vars work/vars.fd --disk work/windows11.img --disk1 work/installer.img --cpus 4 --ram 4608 --web 8080 --vnc 5900
      ```
 2. **Step 1 (Stage B) — Pixel 9 Display Blitter (`devices/fb_android.c`):**
    * Implement `ANativeWindow` + OpenGL ES 3.0 / Vulkan 120 Hz rendering with hardware `BGRX8888` texture swizzling (`GL_TEXTURE_SWIZZLE_R = GL_BLUE`, `GL_TEXTURE_SWIZZLE_B = GL_RED`).
