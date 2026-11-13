@@ -60,6 +60,7 @@ typedef struct HvWinVirt {
 
     uint8_t *ram;
     uint64_t ram_size;
+    int ram_owned;
     uint8_t *dtb;
     size_t dtb_size;
 
@@ -90,5 +91,6 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
                       HvDisk *disk0, HvDisk *disk1, const uint8_t mac[6], int enable_sound);
 void hv_winvirt_reset_cpu(HvWinVirt *b);
 void hv_winvirt_power_button(HvWinVirt *b);
+void hv_winvirt_destroy(HvWinVirt *b);
 
 #endif

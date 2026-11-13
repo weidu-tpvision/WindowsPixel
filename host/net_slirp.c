@@ -18,6 +18,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <libslirp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,6 +58,9 @@ static int wake_pipe[2];
 static Timer timers[MAX_TIMERS];
 static struct pollfd pfds[MAX_POLL];
 static int npfd;
+static atomic_int net_stop;
+static pthread_t net_tid;
+static int net_running;
 uint64_t hv_net_tx_frames, hv_net_rx_frames;
 
 static char share_socket[256];
@@ -325,7 +329,7 @@ static const SlirpCb callbacks = {
 
 static void *net_thread(void *unused) {
     (void)unused;
-    for (;;) {
+    while (!atomic_load_explicit(&net_stop, memory_order_relaxed)) {
         uint32_t timeout = 1000;
         int64_t now = now_ms();
         for (int i = 0; i < MAX_TIMERS; i++)
@@ -412,6 +416,10 @@ void hv_net_poll(void) {
 }
 
 int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
+    atomic_store(&net_stop, 0);
+    memset(&to_guest, 0, sizeof to_guest);
+    memset(&to_host, 0, sizeof to_host);
+    memset(timers, 0, sizeof timers);
     machine = m;
     pthread_mutex_init(&to_guest.mu, NULL);
     pthread_mutex_init(&to_host.mu, NULL);
@@ -452,9 +460,42 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     }
     net = n;
     n->transmit = transmit;
-    pthread_t t;
-    pthread_create(&t, NULL, net_thread, NULL);
+    if (pthread_create(&net_tid, NULL, net_thread, NULL) == 0) {
+        net_running = 1;
+    }
     return 0;
+}
+
+static void drain_queue(Queue *q) {
+    pthread_mutex_lock(&q->mu);
+    while (q->head != q->tail) {
+        free(q->f[q->head++ % QUEUE].data);
+    }
+    pthread_mutex_unlock(&q->mu);
+}
+
+void hv_net_detach(void) {
+    if (net_running) {
+        atomic_store(&net_stop, 1);
+        char c = 0;
+        if (wake_pipe[1] >= 0) (void)!write(wake_pipe[1], &c, 1);
+        pthread_join(net_tid, NULL);
+        net_running = 0;
+    }
+    if (slirp) {
+        slirp_cleanup(slirp);
+        slirp = NULL;
+    }
+    if (wake_pipe[0] >= 0) { close(wake_pipe[0]); wake_pipe[0] = -1; }
+    if (wake_pipe[1] >= 0) { close(wake_pipe[1]); wake_pipe[1] = -1; }
+    drain_queue(&to_guest);
+    drain_queue(&to_host);
+    pthread_mutex_lock(&fwd_mu);
+    npending_fwds = 0;
+    nactive_fwds = 0;
+    pthread_mutex_unlock(&fwd_mu);
+    net = NULL;
+    machine = NULL;
 }
 
 #else /* !(defined(__APPLE__) || defined(HAVE_SLIRP)) */
@@ -463,6 +504,7 @@ uint64_t hv_net_tx_frames, hv_net_rx_frames;
 
 void hv_net_set_share_socket(const char *path) { (void)path; }
 int hv_net_attach(HvMachine *m, HvVirtioNet *n) { (void)m; (void)n; return -1; }
+void hv_net_detach(void) {}
 void hv_net_poll(void) {}
 void hv_net_add_hostfwd(int host_port, int guest_port) { (void)host_port; (void)guest_port; }
 

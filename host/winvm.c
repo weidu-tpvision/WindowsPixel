@@ -38,7 +38,10 @@ static HvDisk disk0 = {.fd = -1};
 static HvDisk disk1 = {.fd = -1};
 static int net_on;
 static int share_on;
+static int vm_created;
 static _Atomic int stop_requested;
+static pthread_t kicker_tid, cpu0_tid;
+static int kicker_started, cpu0_started;
 
 #ifdef __APPLE__
 static os_unfair_lock display_lock = OS_UNFAIR_LOCK_INIT;
@@ -260,6 +263,7 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     pthread_mutex_unlock(&display_lock);
 #endif
 
+    vm_created = 1;
     return 0;
 }
 
@@ -371,16 +375,16 @@ static void *cpu0_thread(void *unused) {
 void hv_winvm_start(int spawn_cpu0, void (*on_exit)(int reason)) {
     exit_cb = on_exit;
     spawn_secondaries();
-    pthread_t kt;
-    pthread_create(&kt, NULL, kicker_thread, NULL);
-    pthread_detach(kt);
+    if (pthread_create(&kicker_tid, NULL, kicker_thread, NULL) == 0) {
+        kicker_started = 1;
+    }
     if (spawn_cpu0) {
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setstacksize(&attr, 8u << 20);
-        pthread_t ct;
-        pthread_create(&ct, &attr, cpu0_thread, NULL);
-        pthread_detach(ct);
+        if (pthread_create(&cpu0_tid, &attr, cpu0_thread, NULL) == 0) {
+            cpu0_started = 1;
+        }
         pthread_attr_destroy(&attr);
     }
 }
@@ -397,6 +401,32 @@ void hv_winvm_stop(void) {
     hv_machine_kick_all(&m);
     for (int i = 0; i < ncpus; i++) hv_cpu_wake(&cpus[i]);
     hv_winvm_flush_disks();
+}
+
+void hv_winvm_destroy(void) {
+    hv_winvm_stop();
+    if (cpu0_started) {
+        pthread_join(cpu0_tid, NULL);
+        cpu0_started = 0;
+    } else if (vm_created) {
+        join_secondaries();
+    }
+    if (kicker_started) {
+        pthread_join(kicker_tid, NULL);
+        kicker_started = 0;
+    }
+    atomic_store_explicit(&display_fb, NULL, memory_order_release);
+    if (net_on) {
+        hv_net_detach();
+        net_on = 0;
+    }
+    if (vm_created) {
+        hv_winvirt_destroy(&board);
+        hv_machine_free(&m);
+        if (disk0.fd >= 0) { hv_disk_close(&disk0); disk0.fd = -1; }
+        if (disk1.fd >= 0) { hv_disk_close(&disk1); disk1.fd = -1; }
+        vm_created = 0;
+    }
 }
 
 void hv_winvm_power_button(void) {

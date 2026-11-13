@@ -172,6 +172,7 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
 #endif
     }
     if (b->ram == MAP_FAILED) return -1;
+    b->ram_owned = (prealloc_ram == NULL);
 
     /* 2. Build Flattened Device Tree (placed at 0x40000000 on every reset) */
     b->dtb = hv_fdt_build_virt(b->ncpus, WINVIRT_RAM_PA, ram_size, &b->dtb_size);
@@ -254,4 +255,29 @@ void hv_winvirt_power_button(HvWinVirt *b) {
     if (!b || !b->gic) return;
     __atomic_fetch_or(&b->ged_events, 0x2U, __ATOMIC_ACQ_REL);
     hv_gicv3_pend(b->gic, WINVIRT_INTID_GED);
+}
+
+void hv_winvirt_destroy(HvWinVirt *b) {
+    if (!b) return;
+    hv_pflash_close(b->flash0);
+    hv_pflash_close(b->flash1);
+    if (b->ram_owned && b->ram && b->ram != MAP_FAILED) {
+        munmap(b->ram, b->ram_size);
+    }
+    free(b->dtb);
+    free(b->gic);
+    free(b->its);
+    free(b->uart);
+    free(b->rtc);
+    free(b->gpio);
+    free(b->fw_cfg);
+    free(b->fb);
+    free(b->pcie);
+    free(b->net);
+    free(b->nvme0);
+    free(b->nvme1);
+    free(b->usb);
+    free(b->hda);
+    free(b->snd);
+    memset(b, 0, sizeof *b);
 }

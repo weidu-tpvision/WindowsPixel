@@ -500,6 +500,7 @@ static void *vnc_client_thread(void *arg) {
     uint32_t cur_w = 1024, cur_h = 768;
     hv_winvm_display_size(&cur_w, &cur_h);
     if (cur_w == 0 || cur_h == 0) { cur_w = 1024; cur_h = 768; }
+    int supports_desktop_size = 0;
 
     uint8_t init_msg[24 + 12] = {
         (uint8_t)(cur_w >> 8), (uint8_t)cur_w,
@@ -524,8 +525,11 @@ static void *vnc_client_thread(void *arg) {
             if (recv_exact(fd, hdr, 3) != 0) break;
             uint16_t nenc = (uint16_t)((hdr[1] << 8) | hdr[2]);
             for (uint16_t i = 0; i < nenc; i++) {
-                uint32_t enc;
-                if (recv_exact(fd, &enc, 4) != 0) goto out;
+                uint8_t enc_be[4];
+                if (recv_exact(fd, enc_be, 4) != 0) goto out;
+                int32_t enc = (int32_t)(((uint32_t)enc_be[0] << 24) | ((uint32_t)enc_be[1] << 16) |
+                                        ((uint32_t)enc_be[2] << 8) | (uint32_t)enc_be[3]);
+                if (enc == -223) supports_desktop_size = 1; /* DesktopSize pseudo-encoding */
             }
         } else if (msg_type == 3) { /* FramebufferUpdateRequest */
             uint8_t req[9];
@@ -533,12 +537,23 @@ static void *vnc_client_thread(void *arg) {
             HvWinVirt *board = hv_winvm_board();
             const uint8_t *px = NULL;
             uint32_t fw = 0, fh = 0, st = 0;
+            uint32_t prev_w = cur_w, prev_h = cur_h;
             if (board && board->fb && hv_fb_display_get_frame(board->fb, &px, &fw, &fh, &st) == 0) {
-                cur_w = fw;
-                cur_h = fh;
+                if (supports_desktop_size || (fw <= prev_w && fh <= prev_h)) {
+                    cur_w = fw;
+                    cur_h = fh;
+                }
             }
             uint16_t w = (uint16_t)(cur_w > 4096 ? 4096 : cur_w);
             uint16_t h = (uint16_t)(cur_h > 4096 ? 4096 : cur_h);
+            if (supports_desktop_size && (cur_w != prev_w || cur_h != prev_h)) {
+                uint8_t ds[16] = {
+                    0, 0, 0, 1, /* FramebufferUpdate, 1 DesktopSize rectangle */
+                    0, 0, 0, 0, (uint8_t)(w >> 8), (uint8_t)w, (uint8_t)(h >> 8), (uint8_t)h,
+                    0xff, 0xff, 0xff, 0x21 /* -223 = DesktopSize */
+                };
+                if (send_bytes(fd, ds, 16) != 0) break;
+            }
             uint8_t fbu[16] = {
                 0, 0, 0, 1, /* Msg 0 (FramebufferUpdate), 1 rectangle */
                 0, 0, 0, 0, (uint8_t)(w >> 8), (uint8_t)w, (uint8_t)(h >> 8), (uint8_t)h,

@@ -202,9 +202,13 @@ class MainActivity : ComponentActivity() {
                             Text("Power", color = Color(0xFFFFB74D), fontSize = 12.sp)
                         }
                         TextButton(onClick = {
-                            WinVmBridge.nativeStopVm()
-                            VmForegroundService.stop(this@MainActivity)
-                            running = false
+                            scope.launch {
+                                withContext(Dispatchers.IO) {
+                                    WinVmBridge.nativeStopVm()
+                                }
+                                VmForegroundService.stop(this@MainActivity)
+                                running = false
+                            }
                         }) {
                             Text("Stop", color = Color(0xFFEF5350), fontSize = 12.sp)
                         }

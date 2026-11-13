@@ -35,6 +35,8 @@ Java_com_winpixel_app_WinVmBridge_nativeStartVm(
     if (atomic_load(&g_vm_running)) {
         return (*env)->NewStringUTF(env, "VM is already running.");
     }
+    /* Clean up any previous VM instance that exited on its own before recreating. */
+    hv_winvm_destroy();
 
     const char *code_fd = j_code_fd ? (*env)->GetStringUTFChars(env, j_code_fd, NULL) : NULL;
     const char *vars_fd = j_vars_fd ? (*env)->GetStringUTFChars(env, j_vars_fd, NULL) : NULL;
@@ -87,10 +89,8 @@ JNIEXPORT void JNICALL
 Java_com_winpixel_app_WinVmBridge_nativeStopVm(JNIEnv *env, jclass clazz) {
     (void)env;
     (void)clazz;
-    if (atomic_load(&g_vm_running)) {
-        hv_winvm_stop();
-        atomic_store(&g_vm_running, 0);
-    }
+    hv_winvm_destroy();
+    atomic_store(&g_vm_running, 0);
 }
 
 JNIEXPORT void JNICALL
