@@ -249,10 +249,20 @@ Open **`http://localhost:8080`** in your local browser (or connect a VNC client 
 
 ### B. Android ARM64 (Google Pixel 9 / Tensor G4 & Android 15/16)
 ```bash
-# Cross-compile libwinvm.so and libwinvm.a with Android NDK (API 34, arm64-v8a, embedded libslirp)
+# 1. (Optional on Linux ARM64 host) Verify native + JNI library cross-compilation:
 make android-lib -j8
-# Output: build/android/libwinvm.so and build/android/libwinvm.a
+# Output: build/android/libwinvm.a, build/android/libwinvm.so, build/android/libwinvm_jni.so
+
+# 2. Build & install the Android APK (open android/ in Android Studio on macOS/x86_64 PC, or via Gradle):
+cd android && ./gradlew installDebug
+
+# 3. Push your provisioned UEFI + Windows 11 images to the Pixel 9:
+#    (Optional) Pack windows11.img into a compact zero-skipping .hvsparse file first:
+./build/hvsparse pack work/windows11.img work/windows11.hvsparse
+adb push work/code.fd work/vars.fd work/windows11.hvsparse /sdcard/Android/data/com.winpixel.app/files/Machines/Win11/
 ```
+4. Launch **WindowsPixel** on your Pixel 9, grant microphone permission if prompted, adjust vCPUs/RAM (`4 vCPUs`, `4096 MB`), and tap **Boot Windows 11 ARM64**.
+   * Use the top floating pill to switch between **Touch** (direct tap/drag) and **Trackpad** (relative cursor), open the **Keyboard**, send **Ctrl+Alt+Del**, or cleanly **Power** off Windows.
 
 ### C. macOS & iOS (Upstream `WindowsiOS` Build)
 - macOS on Apple Silicon (`M1` or newer; developed on M5 Pro) with Xcode, `xcodegen`, `meson`, `ninja`, `pkg-config`, `libslirp`, `llvm`/`lld` (for compiling freestanding `AArch64` Win32 guest helpers), and Python 3.

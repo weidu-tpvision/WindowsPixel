@@ -244,12 +244,15 @@ flowchart LR
         * `winvm` provides a VirtIO-Net adapter (`1af4:1000`) backed by vendored `libslirp` NAT (`10.0.2.0/24`).
         * Attach `work/virtio_net.img` (containing Red Hat's WHQL-signed `NetKVM\w11\ARM64` driver) once via `--disk1 work/virtio_net.img`, then in Windows run **Device Manager $\to$ Ethernet Controller $\to$ Update driver** (or `pnputil /add-driver D:\NetKVM\w11\ARM64\*.inf /install` in an Administrator terminal). Future boots without `--disk1` retain full DHCP/NAT internet (`10.0.2.15`).
      5. Open `http://localhost:8080` in your local browser (or connect a VNC viewer to `localhost:5900`).
-2. **Step 1 (Stage B) — Pixel 9 Display Blitter (`devices/fb_android.c`):**
-   * Implement `ANativeWindow` + OpenGL ES 3.0 / Vulkan 120 Hz rendering with hardware `BGRX8888` texture swizzling (`GL_TEXTURE_SWIZZLE_R = GL_BLUE`, `GL_TEXTURE_SWIZZLE_B = GL_RED`).
-3. **Step 2 (Stage B) — Pixel 9 Duplex Audio (`host/audio_android.cpp`):**
-   * Implement `hv_audio_attach_hda()`, `hv_audio_shutdown()`, and `hv_audio_set_mic_enabled()` using Google Oboe / NDK `AAudio` (48 kHz 16-bit stereo PCM output and microphone input).
-4. **Step 3 (Stage B) — Pixel 9 Android App & JNI Bridge (`android/`):**
-   * Create the Android Gradle project (`com.winpixel.app`), `winvm_jni.cpp`, `VmForegroundService`, Jetpack Compose UI (`SurfaceView` + Direct Touch / Trackpad gestures), and Chrome Custom Tabs OAuth handler (`hv_share_take_open_url()`).
+2. **Stage B Build, Install & Boot on Pixel 9 (`android/`):**
+   * **Verify native libraries on `spark-20aa`:** `make android-lib -j8` builds `build/android/libwinvm.{a,so}` and `build/android/libwinvm_jni.so`.
+   * **Build & install APK:** Open `android/` in **Android Studio** (or run `./gradlew installDebug` on macOS/x86_64 with Android SDK 34 + NDK r27c) to install `com.winpixel.app`.
+   * **Deploy images to Pixel 9:**
+     ```bash
+     ./build/hvsparse pack work/windows11.img work/windows11.hvsparse   # optional compact sparse image
+     adb push work/code.fd work/vars.fd work/windows11.hvsparse /sdcard/Android/data/com.winpixel.app/files/Machines/Win11/
+     ```
+   * **Boot:** Open **WindowsPixel** on Pixel 9 and tap **Boot Windows 11 ARM64** (`MainActivity.kt` + `VmForegroundService.kt` + `devices/fb_android.c` + `host/audio_android.c`).
 
 ---
 
