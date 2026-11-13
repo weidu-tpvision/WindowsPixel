@@ -154,10 +154,14 @@ dd if=/dev/zero of=work/vars.fd bs=1M count=64 status=none
 # ./build/winvm \
 #   --code work/code.fd --vars work/vars.fd \
 #   --disk work/windows11.img \
-#   --cpus 8 --ram 8608 --web 8080 --vnc 5900
+#   --cpus 4 --ram 4608 --web 8080 --vnc 5900
 ```
 Open **`http://localhost:8080`** in your local browser (or connect a VNC client to `localhost:5900`).
 > **Note on `WINPE` installer drive letters:** If `installer.img` uses a GPT EFI System Partition (`EF00`), WinPE intentionally does not auto-assign it a drive letter (`no ltr`). If `startnet.cmd` stops with `no path found`, run `(echo select volume 2 & echo assign letter=I) | diskpart` and then `X:\Windows\System32\startnet.cmd`.
+>
+> **Known runtime notes & diagnostics:**
+> - **vCPU count (`CPUS=4`):** Keep the default `CPUS=4` and `RAM=4608` in [`scripts/launch_spark.sh`](scripts/launch_spark.sh); `--cpus 8` can hit heavy `tr_mu` translation-lock contention when running multi-process JIT apps such as Microsoft Edge.
+> - **Intermittent freeze / slow shutdown (~2M `exc/s` loop):** If Windows stalls after boot or during Start → Shut down, run with `./scripts/launch_spark.sh --stats 5 2>&1 | tee work/winvm_stats.log` to record per-vCPU PCs and `last exc:` (`esr`, `ec`, `far`, `elr`), and press `Ctrl+C` (`SIGINT` flushes host disk handles cleanly).
 
 ### B. Android ARM64 (Google Pixel 9 / Tensor G4 & Android 15/16)
 ```bash

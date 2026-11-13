@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-CPUS="${CPUS:-8}"
-RAM="${RAM:-8608}"
+CPUS="${CPUS:-4}"
+RAM="${RAM:-4608}"
 WEB_PORT="${WEB_PORT:-8080}"
 VNC_PORT="${VNC_PORT:-5900}"
 

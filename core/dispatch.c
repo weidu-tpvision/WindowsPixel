@@ -666,6 +666,9 @@ static void print_stats(HvCpu *cpu, int force) {
             last_busy = busy;
         }
 #endif
+        fprintf(stderr, "  last exc: esr=%08x (ec=%02x) far=%llx elr=%llx spsr=%llx\n",
+                (unsigned)cpu->esr_el1, (unsigned)(cpu->esr_el1 >> 26), (unsigned long long)cpu->far_el1,
+                (unsigned long long)cpu->elr_el1, (unsigned long long)cpu->spsr_el1);
         fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                 RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
         { /* block hash health: chain lengths and how much of it is stale */
