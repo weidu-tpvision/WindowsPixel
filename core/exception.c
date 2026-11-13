@@ -8,6 +8,7 @@
 #include "machine.h"
 #include "dispatch.h"
 #include "mmu.h"
+#include "sysreg.h"
 
 /* Only EL0 and EL1 exist for the guest; HengeVM plays EL2 (PSCI over HVC, as
    QEMU's vmapple machine sets up) and there is no EL3. */
@@ -103,7 +104,108 @@ void hv_raise_undef(HvCpu *cpu, uint64_t pc) {
     hv_raise_sync(cpu, HV_EC_UNKNOWN, 0, 0, pc);
 }
 
+/* ---- fault-loop detector ----
+   A real page fault is resolved by the guest's handler and the access then succeeds: the same
+   (pc, address, fault kind) never repeats more than a few times in a row. Thousands in a row on one
+   CPU is a livelock (the "2M exc/s" freeze): either the guest's tables truly lack the mapping, or
+   this engine walks something other than what the guest just fixed. Report what a fresh walk of the
+   guest's tables sees then, once per loop. HV_FAULT_LOOP_FLUSH=1 also does a local TLBI VMALLE1 at
+   that point: if the loop then stops, stale translation state in the engine caused it. */
+#define FAULT_LOOP_THRESHOLD 20000u
+
+static struct {
+    uint64_t pc, va, n;
+    uint32_t fsc;
+    int flushed;
+} fault_loop[HV_MAX_CPUS];
+
+static void dump_walk(HvCpu *cpu, uint64_t va) {
+    int hi = (va >> 55) & 1;
+    uint64_t tcr = cpu->tcr_el1;
+    uint64_t ttbr = hi ? cpu->ttbr1_el1 : cpu->ttbr0_el1;
+    uint32_t tsz = hi ? (tcr >> 16) & 63 : tcr & 63;
+    uint32_t tg = hi ? (tcr >> 30) & 3 : (tcr >> 14) & 3;
+    int epd = hi ? (tcr >> 23) & 1 : (tcr >> 7) & 1;
+    int a1 = (tcr >> 22) & 1;
+    uint16_t asid = (uint16_t)((a1 ? cpu->ttbr1_el1 : cpu->ttbr0_el1) >> 48);
+    fprintf(stderr, "    sctlr %llx tcr %llx ttbr0 %llx ttbr1 %llx (ASID %u from TTBR%d) EPD%d=%d T%dSZ=%u TG=%u\n",
+            (unsigned long long)cpu->sctlr_el1, (unsigned long long)tcr, (unsigned long long)cpu->ttbr0_el1,
+            (unsigned long long)cpu->ttbr1_el1, asid, a1, hi, epd, hi, tsz, tg);
+    if ((hi ? tg != 2 : tg != 0) || tsz < 16 || tsz > 39) {
+        fprintf(stderr, "    (not a 4 KB-granule 48-bit-or-less regime: descriptor dump skipped)\n");
+        return;
+    }
+    uint32_t bits = 64 - tsz;
+    int level = bits > 39 ? 0 : bits > 30 ? 1 : 2;
+    uint64_t table = ttbr & 0x0000fffffffffffeull;
+    for (; level <= 3; level++) {
+        uint32_t shift = 39 - 9 * (uint32_t)level;
+        uint64_t idx = (va >> shift) & 0x1ff;
+        uint64_t desc = 0, dpa = table + idx * 8;
+        if (hv_phys_read(cpu->m, dpa, &desc, 8) != 0) {
+            fprintf(stderr, "    L%d [%3llu] @pa %llx: not RAM\n", level, (unsigned long long)idx, (unsigned long long)dpa);
+            return;
+        }
+        const char *kind = !(desc & 1) ? "INVALID" : level == 3 ? ((desc & 2) ? "page" : "reserved")
+                                                   : ((desc & 2) ? "table" : "block");
+        fprintf(stderr, "    L%d [%3llu] @pa %llx = %016llx %s\n", level, (unsigned long long)idx,
+                (unsigned long long)dpa, (unsigned long long)desc, kind);
+        if (!(desc & 1) || level == 3 || !(desc & 2)) return;
+        table = desc & 0x0000fffffffff000ull;
+    }
+}
+
+static void fault_loop_report(HvCpu *cpu, uint64_t va, uint32_t fsc, int insn, uint64_t pc, uint64_t n) {
+    uint32_t word = 0;
+    uint64_t ipa;
+    if (!hv_mmu_access(cpu, pc, HV_ACC_EXEC, cpu->el, &ipa)) hv_phys_read(cpu->m, ipa, &word, 4);
+    fprintf(stderr,
+            "winvm: FAULT LOOP on cpu %u: %llu identical %s aborts in a row (fsc %02x) at el%u pc %llx insn %08x va %llx\n",
+            cpu->index, (unsigned long long)n, insn ? "instruction" : "data", fsc, cpu->el, (unsigned long long)pc,
+            word, (unsigned long long)va);
+    fprintf(stderr, "    daif %llx pstate_extra %llx (PAN %d) spsr %llx elr %llx\n", (unsigned long long)cpu->daif,
+            (unsigned long long)cpu->pstate_extra, (int)((cpu->pstate_extra >> 22) & 1),
+            (unsigned long long)cpu->spsr_el1, (unsigned long long)cpu->elr_el1);
+    dump_walk(cpu, va);
+    for (int el = 1; el >= 0; el--) {
+        HvWalk w;
+        hv_mmu_walk(cpu, va, insn ? HV_ACC_EXEC : HV_ACC_READ, el, &w);
+        fprintf(stderr, "    fresh hv_mmu_walk as el%d: fsc %02x pa %llx r%d w%d x%d\n", el, w.fsc,
+                (unsigned long long)w.pa, w.r, w.w, w.x);
+    }
+}
+
+static void fault_loop_track(HvCpu *cpu, int insn, uint64_t va, uint32_t fsc, uint64_t pc) {
+    if (cpu->index >= HV_MAX_CPUS) return;
+    __typeof__(fault_loop[0]) *l = &fault_loop[cpu->index];
+    /* Same fault kind (translation/access/permission), any level: the level moves as tables fill in. */
+    if (pc == l->pc && va == l->va && (fsc & 0x3c) == (l->fsc & 0x3c)) {
+        l->n++;
+    } else {
+        if (l->n >= FAULT_LOOP_THRESHOLD)
+            fprintf(stderr, "winvm: fault loop on cpu %u ended after %llu repeats%s\n", cpu->index,
+                    (unsigned long long)l->n, l->flushed ? " (after the diagnostic TLB flush)" : "");
+        l->pc = pc, l->va = va, l->fsc = fsc, l->n = 1, l->flushed = 0;
+        return;
+    }
+    if (l->n == FAULT_LOOP_THRESHOLD) {
+        fault_loop_report(cpu, va, fsc, insn, pc, l->n);
+        static int flush_knob = -1;
+        if (flush_knob < 0) flush_knob = getenv("HV_FAULT_LOOP_FLUSH") != NULL;
+        if (flush_knob) {
+            fprintf(stderr, "    HV_FAULT_LOOP_FLUSH: doing a local TLBI VMALLE1 on cpu %u\n", cpu->index);
+            hv_tlbi_apply(cpu, 0, 8, 7, 0, 0);
+            l->flushed = 1;
+        }
+    } else if (l->n == 4 * FAULT_LOOP_THRESHOLD) {
+        fprintf(stderr, "winvm: fault loop on cpu %u still going after %llu repeats%s; fresh state now:\n", cpu->index,
+                (unsigned long long)l->n, l->flushed ? " (the TLB flush did not help)" : "");
+        dump_walk(cpu, va);
+    }
+}
+
 void hv_raise_abort(HvCpu *cpu, int insn, uint64_t va, uint32_t fsc, int wnr, int s1ptw, uint64_t pc) {
+    fault_loop_track(cpu, insn, va, fsc, pc);
     uint32_t ec = insn ? (cpu->el ? HV_EC_IABT_SAME : HV_EC_IABT_LOWER)
                        : (cpu->el ? HV_EC_DABT_SAME : HV_EC_DABT_LOWER);
     uint32_t iss = fsc | (uint32_t)(wnr && !insn) << 6 | (uint32_t)s1ptw << 7;

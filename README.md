@@ -159,10 +159,28 @@ dd if=/dev/zero of=work/vars.fd bs=1M count=64 status=none
 ```
 Open **`http://localhost:8080`** in your local browser (or connect a VNC client to `localhost:5900`).
 > **Note on `WINPE` installer drive letters:** If `installer.img` uses a GPT EFI System Partition (`EF00`), WinPE intentionally does not auto-assign it a drive letter (`no ltr`). If `startnet.cmd` stops with `no path found`, run `(echo select volume 2 & echo assign letter=I) | diskpart` and then `X:\Windows\System32\startnet.cmd`.
->
-> **Known runtime notes & diagnostics:**
-> - **vCPU count (`CPUS=4`):** Keep the default `CPUS=4` and `RAM=4608` in [`scripts/launch_spark.sh`](scripts/launch_spark.sh); `--cpus 8` can hit heavy `tr_mu` translation-lock contention when running multi-process JIT apps such as Microsoft Edge.
-> - **Intermittent freeze / slow shutdown (~2M `exc/s` loop):** If Windows stalls after boot or during Start → Shut down, run with `./scripts/launch_spark.sh --stats 5 2>&1 | tee work/winvm_stats.log` to record per-vCPU PCs and `last exc:` (`esr`, `ec`, `far`, `elr`), and press `Ctrl+C` (`SIGINT` flushes host disk handles cleanly).
+
+#### Runtime options
+
+[`scripts/launch_spark.sh`](scripts/launch_spark.sh) takes environment overrides and passes any other flags through to `build/winvm`:
+
+| Variable | Default | Meaning |
+| :--- | :--- | :--- |
+| `CPUS` | `4` | vCPUs (up to 8 on Linux; 4 is the verified configuration) |
+| `RAM` | `4608` | Guest RAM in MB (reserved lazily with `MAP_NORESERVE`; 8 GB gives Windows more headroom for heavy apps) |
+| `WEB_PORT` / `VNC_PORT` | `8080` / `5900` | Built-in HTML5 viewer and RFB 3.8 VNC server |
+| `LISTEN` | `127.0.0.1` | Bind address for both viewers (`--listen`). Neither has authentication, so use SSH forwarding, or `0.0.0.0` only on a trusted network. |
+
+Useful `winvm` flags: `--stats <sec>` (JIT, MMU, exception and per-vCPU statistics), `--cmd-file <path>` (scripted input: `type`, `click`, `cad`, `screenshot`, `cpus`, …), `--screenshot <png>`, `--timeout <sec>`, `--share <dir>` (host folder at `http://10.0.2.4/` in the guest), `--no-net`. `Ctrl+C` stops the VM and flushes the disk; a second `Ctrl+C` exits immediately.
+
+#### Diagnostics
+
+[`scripts/trace_freeze.sh`](scripts/trace_freeze.sh) records a session for performance and stability analysis:
+- `run` boots with `--stats 5` and logs every host disk flush with its duration;
+- `bt` captures per-thread state (and `gdb` backtraces when possible) while the VM is running;
+- `report` summarizes flush latency and stats gaps.
+
+The engine also reports livelocked page faults by itself (`FAULT LOOP` in the log, with the guest's page-table walk); `HV_FAULT_LOOP_FLUSH=1` adds a diagnostic TLB flush when that happens. `HV_FLUSH=0|1|2` selects how guest NVMe FLUSH commands reach the host: `fsync` (Linux default), deferred, or `fdatasync`.
 
 ### B. Android ARM64 (Google Pixel 9 / Tensor G4 & Android 15/16)
 ```bash
@@ -187,6 +205,24 @@ adb push work/code.fd work/vars.fd work/windows11.hvsparse /sdcard/Android/data/
 ```
 4. Launch **WindowsPixel** on your Pixel 9, grant microphone permission if prompted, adjust vCPUs/RAM (`4 vCPUs`, `4096 MB`), and tap **Boot Windows 11 ARM64**.
    * Use the top floating pill to switch between **Touch** (direct tap/drag) and **Trackpad** (relative cursor), open the **Keyboard** (supports Android IME + hardware keys), send **Ctrl+Alt+Del**, or cleanly **Power** off / **Stop** Windows.
+
+---
+
+## Project Status & Roadmap
+
+| Area | Status |
+| :--- | :--- |
+| ARM64→ARM64 JIT, 4 KB MMU, SMP (up to 8 vCPUs on Linux) | Working; boots Windows 11 24H2 ARM64 to the desktop and runs Edge and Task Manager on DGX Spark |
+| Devices (NVMe, xHCI, HDA, virtio-net + SLIRP, ramfb, ACPI/SMBIOS) | Working on Linux; NetKVM needs the virtio-win driver; there is no host audio backend on Linux |
+| Linux runner (web viewer, VNC, PNG, scripted input, stats) | Working; viewers bind to loopback by default |
+| Android (Pixel 9) native libraries, JNI, Compose app, GLES display, AAudio | Built (libraries and debug APK); device boot test pending |
+| iOS / macOS (upstream WindowsiOS paths) | Kept intact behind `__APPLE__`; not rebuilt in this fork |
+
+**Next up**
+- Validate boot, display, input and audio on a physical Pixel 9.
+- Find and fix an intermittent page-fault livelock seen under heavy guest memory pressure. The built-in `FAULT LOOP` diagnostics capture its state.
+- Move NVMe I/O off the vCPU threads, and reduce translation-lock contention for multi-process workloads.
+- Android polish: microphone foreground-service type, runtime notification permission, opening audio streams off the vCPU thread.
 
 ---
 
