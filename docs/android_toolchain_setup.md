@@ -17,6 +17,9 @@ The entire toolchain runs natively on ARM64 without requiring `sudo` or root per
 | **Android Debug Bridge (ADB)** | 1.0.41 (API 34) | `~/.local/usr/lib/android-sdk/` | `~/.local/bin/adb` |
 | **LLVM Compiler Suite** | Clang 18.1.3 + LLD | `~/.local/usr/lib/llvm-18/` | `~/.local/bin/clang`, `lld` |
 | **Android NDK** | r27c (`27.2.12479018`) | `~/Android/Sdk/ndk/27.2.12479018` | NDK sysroots and headers |
+| **Android SDK Platforms & Tools** | API 34 (`android-34`), `build-tools 34.0.0`, `cmake 3.22.1` | `~/Android/Sdk/{platforms,build-tools,cmake}` | SDK compile jars & build metadata |
+| **Gradle** | 8.9 | `~/.local/gradle-8.9` | `android/gradlew` wrapper |
+| **Native ARM64 `aapt2`** | `2.19-debian` (`aapt` + `android-lib*` `.deb`s) | `~/.local/usr/lib/android-sdk/build-tools/debian/` | `~/.local/bin/aapt2` |
 | **Android NDK C Compiler** | Target `aarch64-linux-android34` | `~/.local/bin` | `~/.local/bin/aarch64-linux-android34-clang` |
 | **Android NDK C++ Compiler** | Target `aarch64-linux-android34` | `~/.local/bin` | `~/.local/bin/aarch64-linux-android34-clang++` |
 
@@ -68,6 +71,11 @@ exec "$HOME/.local/bin/clang" \
   -fuse-ld=lld \
   "$@"
 ```
+
+### C. Native ARM64 `aapt2` & Prebuilt JNI Packaging for Gradle APK Builds
+Google's Maven `aapt2` and SDK `cmake` binaries are `x86_64` ELFs. To build `.apk` bundles directly on `spark-20aa` without `sudo` or `libc6:amd64`:
+1. Native ARM64 `aapt2` (`2.19-debian`) and its `android-lib*` shared libraries are extracted into `~/.local/` and invoked via `~/.local/bin/aapt2` (setting `LD_LIBRARY_PATH` to `~/.local/usr/lib/aarch64-linux-gnu/android`).
+2. `make android-lib` builds `build/android/libwinvm_jni.so` natively using `aarch64-linux-android34-clang`, and Gradle packages it with `-PusePrebuiltJni=true -Pandroid.aapt2FromMavenOverride="$HOME/.local/bin/aapt2"`.
 
 ---
 
