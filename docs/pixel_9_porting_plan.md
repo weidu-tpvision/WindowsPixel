@@ -167,11 +167,11 @@ flowchart LR
 | **JIT Allocator (`host/jit_region.c`)**| **Done & Verified** | Complete | Linux `memfd_create` RX/RW + SELinux `execmem` fallback |
 | **`devices/` & `host/` Portability** | **Done & Verified** | Complete | `winvirt.c`, `winvm.c`, `disk.c`, `share.c`, `net_slirp.c` |
 | **Build System (`Makefile`, `CMakeLists.txt`)** | **Done & Verified** | Complete | Native Linux ARM64 + Android API 34 (`libwinvm.so` / `.a`) |
-| **Stage A: `spark-20aa` Runner (`main_linux.c`)** | **Done & Verified** | Complete | `host/main_linux.c` (CLI + Web Canvas + VNC + PNG export) |
-| **Networking (`third_party/libslirp`)** | **Done & Verified** | Complete | Vendored `libslirp` v4.8.0 + `glib.h` shim (Linux + Android) |
-| **Stage B: Display (`ANativeWindow` + GLES 3.0)** | **Implemented & Linked** | Ready for Device Test | `devices/fb_android.c` (hardware `BGRX8888` texture swizzle) |
+| **Stage A: `spark-20aa` Runner (`main_linux.c`)** | **Done & Verified** | Complete | `host/main_linux.c` (CLI + Web Canvas + VNC w/ `DesktopSize` + PNG export) |
+| **Networking (`third_party/libslirp`)** | **Done & Verified** | Complete | Vendored `libslirp` v4.8.0 + `glib.h` shim + `hv_net_detach()` teardown |
+| **Stage B: Display (`ANativeWindow` + GLES 3.0)** | **Implemented & Linked** | Ready for Device Test | `devices/fb_android.c` (`BGRX8888` swizzle + sync `surfaceDestroyed`) |
 | **Stage B: Audio (AAudio `audio_android.c`)** | **Implemented & Linked** | Ready for Device Test | `host/audio_android.c` (48 kHz S16LE full-duplex playback + mic) |
-| **Stage B: Android UI, JNI & Chrome Custom Tabs** | **Implemented & Linked** | Ready for APK Build | `android/` Compose UI, `VmForegroundService`, `winvm_jni.c` |
+| **Stage B: Android UI, JNI & Chrome Custom Tabs** | **Implemented & Linked** | Ready for APK Build | `android/` Compose UI + IME `InputConnection`, `VmForegroundService`, `winvm_jni.c` (`hv_winvm_destroy()`) |
 
 ---
 
