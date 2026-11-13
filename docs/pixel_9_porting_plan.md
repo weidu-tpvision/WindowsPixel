@@ -70,9 +70,9 @@ flowchart TB
 ```mermaid
 flowchart LR
     P1["Phase 1: Core Engine & ELF (Done)"] --> P2["Phase 2: Linux JIT & Memory (Done)"]
-    P2 --> P2B["Phase 2.5: DGX Spark Linux Runner (Active)"]
-    P2B --> P3["Phase 3: Pixel 9 Display, Audio & Net"]
-    P3 --> P4["Phase 4: Pixel 9 Compose UI & APK"]
+    P2 --> P2B["Phase 2.5: DGX Spark Linux Runner (Done)"]
+    P2B --> P3["Phase 3: Pixel 9 Display, Audio & Net (Implemented)"]
+    P3 --> P4["Phase 4: Pixel 9 Compose UI & APK (Implemented)"]
 ```
 
 ### Phase 1: NDK Build Setup, ELF Assembly Conversion & Timer Scaling (**COMPLETED & VERIFIED**)

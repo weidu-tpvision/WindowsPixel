@@ -3,7 +3,7 @@
 # WindowsPixel
 
 **Full Microsoft Windows 11 24H2 ARM64 running at near-native JIT speed on Linux ARM64 (NVIDIA DGX Spark) and Android (Google Pixel 9 / Tensor G4 & more) — without root or KVM.**  
-*Forked from [`WindowsiOS`](https://github.com/ammaar/WindowsiOS) and adapted in two stages: **Stage A: DGX Spark (Linux ARM64 — Complete & Verified)** $\to$ **Stage B: Google Pixel 9 (Android 15/16 — Engine Ready, UI/AV In Progress)**.*
+*Forked from [`WindowsiOS`](https://github.com/ammaar/WindowsiOS) and adapted in two stages: **Stage A: DGX Spark (Linux ARM64 — Complete & Verified)** $\to$ **Stage B: Google Pixel 9 (Android 15/16 — Implemented & Linked, Ready for APK Build & Device Test)**.*
 
 [![License: GPL v2+](https://img.shields.io/badge/License-GPL--2.0--or--later-blue.svg)](LICENSE)
 [![Guest OS](https://img.shields.io/badge/Guest-Windows_11_24H2_ARM64_(Build_26100%2B)-0078D4.svg)](#porting-status-dgx-spark--pixel-9)
@@ -21,7 +21,7 @@
 | Target / Stage | Status | Highlights |
 | :--- | :--- | :--- |
 | **Stage A: NVIDIA DGX Spark (`spark-20aa`, Linux ARM64)** | **Complete & Verified** | Standalone `./build/winvm` ([`host/main_linux.c`](host/main_linux.c)), 24.000 MHz JIT counter scaling, `memfd_create` RX/RW JIT, built-in HTML5 Canvas (`--web 8080`), RFB 3.8 VNC (`--vnc 5900`), pure-C PNG export, vendored `libslirp` v4.8.0 NAT. **Verified booting Windows 11 ARM64 (Build 26300) WinPE GUI across 4 vCPUs.** |
-| **Stage B: Google Pixel 9 (Tensor G4, Android 15/16) & ARM64 Android** | **Engine Ready · UI/AV Next** | `make android-lib` builds `build/android/libwinvm.so` & `.a` (NDK API 34, `-DHAVE_SLIRP=1`, Tensor G4 `cpus 4..7` pinning, SELinux `execmem` fallback, `MAP_NORESERVE` RAM). Next: `ANativeWindow` 120 Hz Vulkan/GLES blitter, Oboe/AAudio duplex sound, Jetpack Compose + Chrome Custom Tabs OAuth UI. |
+| **Stage B: Google Pixel 9 (Tensor G4, Android 15/16) & ARM64 Android** | **Implemented & Linked · Device Test Next** | `make android-lib` builds `build/android/libwinvm.{a,so}` and `libwinvm_jni.so` (NDK API 34, `-DHAVE_SLIRP=1`, Tensor G4 `cpus 4..7` pinning, SELinux `execmem` fallback, `MAP_NORESERVE` RAM). Includes `ANativeWindow` + GLES 3.0 120 Hz blitter ([`devices/fb_android.c`](devices/fb_android.c)), AAudio full-duplex sound ([`host/audio_android.c`](host/audio_android.c)), JNI bridge ([`winvm_jni.c`](android/app/src/main/cpp/winvm_jni.c)), and Jetpack Compose + Chrome Custom Tabs OAuth UI ([`android/`](android/)). |
 | **macOS & iOS (`WindowsiOS` upstream)** | **Preserved** | All `#ifdef __APPLE__` Metal, CoreAudio, TXM, and Xcode/iOS paths remain intact. |
 
 See [`docs/pixel_9_porting_plan.md`](docs/pixel_9_porting_plan.md) and [`docs/android_toolchain_setup.md`](docs/android_toolchain_setup.md) for the full architecture review, Tensor G4 / Linux findings, and Stage B roadmap.
@@ -253,8 +253,8 @@ Open **`http://localhost:8080`** in your local browser (or connect a VNC client 
 make android-lib -j8
 # Output: build/android/libwinvm.a, build/android/libwinvm.so, build/android/libwinvm_jni.so
 
-# 2. Build & install the Android APK (open android/ in Android Studio on macOS/x86_64 PC, or via Gradle):
-cd android && ./gradlew installDebug
+# 2. Build & install the Android APK (open android/ in Android Studio on macOS/x86_64 PC, or via system Gradle):
+cd android && gradle installDebug
 
 # 3. Push your provisioned UEFI + Windows 11 images to the Pixel 9:
 #    (Optional) Pack windows11.img into a compact zero-skipping .hvsparse file first:

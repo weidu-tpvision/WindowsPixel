@@ -172,6 +172,9 @@ uint64_t hv_winvm_display_frames(void) {
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
 #ifdef __APPLE__
     return fb ? hv_fb_metal_frames(fb) : 0;
+#elif defined(__ANDROID__)
+    (void)fb;
+    return hv_fb_android_frames();
 #else
     return (fb && fb->active) ? 1 : 0;
 #endif

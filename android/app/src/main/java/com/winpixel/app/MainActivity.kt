@@ -11,6 +11,9 @@ import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
+import android.view.inputmethod.BaseInputConnection
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -32,13 +35,18 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 class MainActivity : ComponentActivity() {
 
     private var surfaceViewRef: SurfaceView? = null
     private var trackpadMode by mutableStateOf(false)
+    private var guestWidth = 800
+    private var guestHeight = 600
     private var cursorX = 0.5
     private var cursorY = 0.5
     private var lastTouchX = 0f
@@ -89,7 +97,9 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun WinPixelScreen(machineDir: File, shareDir: File, shareSock: File) {
+        val scope = rememberCoroutineScope()
         var running by remember { mutableStateOf(WinVmBridge.nativeIsRunning()) }
+        var starting by remember { mutableStateOf(false) }
         var errorMsg by remember { mutableStateOf<String?>(null) }
         var cpus by remember { mutableIntStateOf(4) }
         var ramMb by remember { mutableIntStateOf(4096) }
@@ -118,6 +128,11 @@ class MainActivity : ComponentActivity() {
                     VmForegroundService.stop(this@MainActivity)
                     break
                 }
+                val sz = WinVmBridge.nativeDisplaySize()
+                if (sz.size >= 2 && sz[0] > 0 && sz[1] > 0) {
+                    guestWidth = sz[0]
+                    guestHeight = sz[1]
+                }
                 val oauthUrl = WinVmBridge.nativePollOpenUrl()
                 if (!oauthUrl.isNullOrBlank()) {
                     runCatching {
@@ -134,7 +149,7 @@ class MainActivity : ComponentActivity() {
                 AndroidView(
                     modifier = Modifier.fillMaxSize(),
                     factory = { ctx ->
-                        SurfaceView(ctx).apply {
+                        VmSurfaceView(ctx).apply {
                             isFocusable = true
                             isFocusableInTouchMode = true
                             surfaceViewRef = this
@@ -268,32 +283,38 @@ class MainActivity : ComponentActivity() {
                         Text(errorMsg!!, color = Color(0xFFEF5350), fontSize = 13.sp)
                     }
                     Button(
-                        enabled = ready,
+                        enabled = ready && !starting,
                         onClick = {
                             errorMsg = null
+                            starting = true
                             VmForegroundService.start(this@MainActivity)
-                            val err = WinVmBridge.nativeStartVm(
-                                codeFile.absolutePath,
-                                varsFile.absolutePath,
-                                diskFile.absolutePath,
-                                disk1File?.absolutePath,
-                                shareDir.absolutePath,
-                                shareSock.absolutePath,
-                                cpus,
-                                ramMb,
-                                soundEnabled,
-                                false
-                            )
-                            if (err != null) {
-                                errorMsg = err
-                                VmForegroundService.stop(this@MainActivity)
-                            } else {
-                                running = true
+                            scope.launch {
+                                val err = withContext(Dispatchers.IO) {
+                                    WinVmBridge.nativeStartVm(
+                                        codeFile.absolutePath,
+                                        varsFile.absolutePath,
+                                        diskFile.absolutePath,
+                                        disk1File?.absolutePath,
+                                        shareDir.absolutePath,
+                                        shareSock.absolutePath,
+                                        cpus,
+                                        ramMb,
+                                        soundEnabled,
+                                        false
+                                    )
+                                }
+                                starting = false
+                                if (err != null) {
+                                    errorMsg = err
+                                    VmForegroundService.stop(this@MainActivity)
+                                } else {
+                                    running = true
+                                }
                             }
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("Boot Windows 11 ARM64")
+                        Text(if (starting) "Starting VM..." else "Boot Windows 11 ARM64")
                     }
                 }
             }
@@ -310,9 +331,8 @@ class MainActivity : ComponentActivity() {
     private fun mapTouchToGuest(view: View, rawX: Float, rawY: Float): Pair<Double, Double> {
         val vw = view.width.toDouble().coerceAtLeast(1.0)
         val vh = view.height.toDouble().coerceAtLeast(1.0)
-        val sz = WinVmBridge.nativeDisplaySize()
-        val gw = (sz.getOrNull(0) ?: 800).toDouble().coerceAtLeast(1.0)
-        val gh = (sz.getOrNull(1) ?: 600).toDouble().coerceAtLeast(1.0)
+        val gw = guestWidth.toDouble().coerceAtLeast(1.0)
+        val gh = guestHeight.toDouble().coerceAtLeast(1.0)
         val guestAspect = gw / gh
         val viewAspect = vw / vh
         val rx: Double
@@ -421,6 +441,80 @@ class MainActivity : ComponentActivity() {
             KeyEvent.KEYCODE_DPAD_DOWN -> 0x51
             KeyEvent.KEYCODE_DPAD_UP -> 0x52
             else -> 0
+        }
+    }
+
+    private fun typeAsciiChar(ch: Char) {
+        var shift = false
+        val usage = when (ch) {
+            in 'a'..'z' -> 0x04 + (ch - 'a')
+            in 'A'..'Z' -> { shift = true; 0x04 + (ch - 'A') }
+            in '1'..'9' -> 0x1e + (ch - '1')
+            '0' -> 0x27
+            ' ' -> 0x2c
+            '\n', '\r' -> 0x28
+            '\t' -> 0x2b
+            '-' -> 0x2d
+            '_' -> { shift = true; 0x2d }
+            '=' -> 0x2e
+            '+' -> { shift = true; 0x2e }
+            '[' -> 0x2f
+            '{' -> { shift = true; 0x2f }
+            ']' -> 0x30
+            '}' -> { shift = true; 0x30 }
+            '\\' -> 0x31
+            '|' -> { shift = true; 0x31 }
+            ';' -> 0x33
+            ':' -> { shift = true; 0x33 }
+            '\'' -> 0x34
+            '"' -> { shift = true; 0x34 }
+            '`' -> 0x35
+            '~' -> { shift = true; 0x35 }
+            ',' -> 0x36
+            '<' -> { shift = true; 0x36 }
+            '.' -> 0x37
+            '>' -> { shift = true; 0x37 }
+            '/' -> 0x38
+            '?' -> { shift = true; 0x38 }
+            '!' -> { shift = true; 0x1e }
+            '@' -> { shift = true; 0x1f }
+            '#' -> { shift = true; 0x20 }
+            '$' -> { shift = true; 0x21 }
+            '%' -> { shift = true; 0x22 }
+            '^' -> { shift = true; 0x23 }
+            '&' -> { shift = true; 0x24 }
+            '*' -> { shift = true; 0x25 }
+            '(' -> { shift = true; 0x26 }
+            ')' -> { shift = true; 0x27 }
+            else -> 0
+        }
+        if (usage == 0) return
+        if (shift) WinVmBridge.nativeKeyHid(0xe1, true)
+        WinVmBridge.nativeKeyHid(usage, true)
+        WinVmBridge.nativeKeyHid(usage, false)
+        if (shift) WinVmBridge.nativeKeyHid(0xe1, false)
+    }
+
+    private inner class VmSurfaceView(context: Context) : SurfaceView(context) {
+        override fun onCheckIsTextEditor(): Boolean = true
+
+        override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+            outAttrs.inputType = EditorInfo.TYPE_CLASS_TEXT or EditorInfo.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_ACTION_NONE
+            return object : BaseInputConnection(this, false) {
+                override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                    text?.forEach { typeAsciiChar(it) }
+                    return true
+                }
+
+                override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+                    repeat(beforeLength.coerceAtLeast(0)) {
+                        WinVmBridge.nativeKeyHid(0x2a, true)
+                        WinVmBridge.nativeKeyHid(0x2a, false)
+                    }
+                    return true
+                }
+            }
         }
     }
 }

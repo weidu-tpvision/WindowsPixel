@@ -26,9 +26,11 @@
 
 static pthread_mutex_t g_fb_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_fb_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_fb_ack_cv = PTHREAD_COND_INITIALIZER;
 static HvFbDisplay *g_fb_disp = NULL;
 static ANativeWindow *g_win = NULL;
 static int g_win_changed = 0;
+static int g_surface_bound = 0;
 static int g_thread_started = 0;
 static int g_stop_thread = 0;
 static pthread_t g_render_thread;
@@ -236,14 +238,20 @@ static void *fb_render_thread(void *arg) {
     for (;;) {
         pthread_mutex_lock(&g_fb_mu);
         while (!g_stop_thread && !g_win) {
-            pthread_mutex_unlock(&g_fb_mu);
-            egl_destroy_surface(&e);
-            pthread_mutex_lock(&g_fb_mu);
-            if (!g_stop_thread && !g_win) {
+            if (g_surface_bound) {
+                pthread_mutex_unlock(&g_fb_mu);
+                egl_destroy_surface(&e);
+                pthread_mutex_lock(&g_fb_mu);
+                g_surface_bound = 0;
+                pthread_cond_broadcast(&g_fb_ack_cv);
+            } else {
+                pthread_cond_broadcast(&g_fb_ack_cv);
                 pthread_cond_wait(&g_fb_cv, &g_fb_mu);
             }
         }
         if (g_stop_thread) {
+            g_surface_bound = 0;
+            pthread_cond_broadcast(&g_fb_ack_cv);
             pthread_mutex_unlock(&g_fb_mu);
             break;
         }
@@ -260,6 +268,9 @@ static void *fb_render_thread(void *arg) {
                 usleep(16000);
                 continue;
             }
+            pthread_mutex_lock(&g_fb_mu);
+            g_surface_bound = 1;
+            pthread_mutex_unlock(&g_fb_mu);
         }
 
         EGLint surf_w = 0, surf_h = 0;
@@ -347,6 +358,12 @@ void hv_fb_android_set_window(HvFbDisplay *fb, struct ANativeWindow *win) {
             g_thread_started = 1;
     }
     pthread_cond_broadcast(&g_fb_cv);
+    /* SurfaceHolder.surfaceDestroyed requires rendering to stop before returning. */
+    if (!win && g_thread_started) {
+        while (g_surface_bound && !g_stop_thread) {
+            pthread_cond_wait(&g_fb_ack_cv, &g_fb_mu);
+        }
+    }
     pthread_mutex_unlock(&g_fb_mu);
 }
 

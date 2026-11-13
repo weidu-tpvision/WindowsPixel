@@ -577,6 +577,7 @@ static void *vnc_client_thread(void *arg) {
             uint8_t hdr[7];
             if (recv_exact(fd, hdr, 7) != 0) break;
             uint32_t len = ((uint32_t)hdr[3] << 24) | ((uint32_t)hdr[4] << 16) | ((uint32_t)hdr[5] << 8) | hdr[6];
+            if (len > (16u << 20)) break;
             char *cut = malloc((size_t)len + 1);
             if (!cut || recv_exact(fd, cut, len) != 0) { free(cut); break; }
             cut[len] = 0;
