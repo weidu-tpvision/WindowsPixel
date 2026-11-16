@@ -37,26 +37,18 @@ See [`docs/pixel_9_porting_plan.md`](docs/pixel_9_porting_plan.md), [`docs/andro
       <sub><b>DGX Spark (45s from cold UEFI boot):</b> Windows 11 ARM64 User Welcome screen across 4 vCPUs via <code>./build/winvm --headless --screenshot ...</code>.</sub>
     </td>
     <td align="center" width="50%">
-      <img src="docs/images/spark_win11_desktop.png" alt="Windows 11 ARM64 Task Manager on NVIDIA DGX Spark" />
-      <br />
-      <sub><b>DGX Spark Desktop & Task Manager:</b> Live Windows 11 ARM64 running across 4 vCPUs, 4.5 GB RAM, and NVMe storage via the built-in web viewer.</sub>
-    </td>
-  </tr>
-</table>
-
-<table>
-  <tr>
-    <td align="center" width="33%">
       <img src="docs/images/spark_win11_home_desktop.png" alt="Windows 11 ARM64 Desktop on NVIDIA DGX Spark" />
       <br />
       <sub><b>Windows 11 ARM64 Desktop:</b> Full Windows 11 desktop environment running under <code>WindowsPixel</code>.</sub>
     </td>
-    <td align="center" width="33%">
+  </tr>
+  <tr>
+    <td align="center" width="50%">
       <img src="docs/images/spark_win11_taskmgr_cpu.png" alt="Windows 11 Task Manager showing ARM Cortex-A725 (WindowsPixel JIT) CPU, Memory, NVMe Disk, and Ethernet" />
       <br />
       <sub><b>Task Manager (<code>ARM Cortex-A725 (WindowsPixel JIT)</code>):</b> 4 vCPUs, 4.5 GB RAM, NVMe storage, and live VirtIO Ethernet via <code>libslirp</code>.</sub>
     </td>
-    <td align="center" width="33%">
+    <td align="center" width="50%">
       <img src="docs/images/spark_win11_edge_youtube.png" alt="Microsoft Edge loading YouTube inside Windows 11 ARM64 on NVIDIA DGX Spark" />
       <br />
       <sub><b>Live Internet Browsing (Edge + YouTube):</b> Microsoft Edge rendering YouTube over VirtIO-Net + <code>libslirp</code> NAT.</sub>
