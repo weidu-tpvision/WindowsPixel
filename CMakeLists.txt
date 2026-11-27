@@ -12,12 +12,13 @@ add_compile_options(
     -D_GNU_SOURCE
 )
 
-# Android NDK enables ShadowCallStack (SCS) in some configurations, which
-# reserves x18 as the shadow call stack pointer. Our ARM64 JIT steals x18
-# while in guest code and saves/restores host x18 across helper calls, so we
-# disable SCS instrumentation on C compilation units.
+# Guest x18 lives in HvCpu rather than host x18, but our assembly thunks in
+# host/enter.S switch SP and return addresses directly without ShadowCallStack
+# prologues, so keep SCS disabled on Android C compilation units. Also enforce
+# 16 KB ELF segment alignment for Android 15/16+ (Pixel 9) compatibility.
 if(ANDROID)
     add_compile_options(-fno-sanitize=shadow-call-stack)
+    add_link_options(-Wl,-z,max-page-size=16384)
 endif()
 
 include_directories(

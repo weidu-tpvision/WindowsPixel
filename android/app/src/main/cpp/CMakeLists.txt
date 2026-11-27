@@ -23,6 +23,8 @@ find_library(egl-lib EGL)
 find_library(gles3-lib GLESv3)
 find_library(aaudio-lib aaudio)
 
+target_link_options(winvm_jni PRIVATE -Wl,-z,max-page-size=16384)
+
 target_link_libraries(winvm_jni PRIVATE
     winvm_static
     ${egl-lib}

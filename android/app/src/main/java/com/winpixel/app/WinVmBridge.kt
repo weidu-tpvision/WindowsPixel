@@ -21,6 +21,9 @@ object WinVmBridge {
     ): String?
 
     external fun nativeStopVm()
+    external fun nativeFlushDisks()
+    external fun nativeUnpackSparse(srcPath: String, dstPath: String): String?
+    external fun nativeUnpackProgress(): Int
     external fun nativePowerButton()
     external fun nativeSetSurface(surface: Surface?)
     external fun nativeTabletEvent(xNorm: Double, yNorm: Double, buttons: Int, wheel: Int)

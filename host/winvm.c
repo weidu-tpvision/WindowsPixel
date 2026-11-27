@@ -78,7 +78,9 @@ static int fail(char *err, size_t n, const char *msg) {
     return -1;
 }
 
+#ifndef __ANDROID__
 static struct sigaction prior_ill, prior_bus, prior_segv;
+static int sig_handlers_installed;
 static void on_ill(int sig, siginfo_t *info, void *ctx) {
     ucontext_t *uc = ctx;
 #ifdef __APPLE__
@@ -101,6 +103,7 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
     struct sigaction *prior = sig == SIGILL ? &prior_ill : sig == SIGBUS ? &prior_bus : &prior_segv;
     sigaction(sig, prior, NULL);
 }
+#endif
 
 static void prepare_cpu_thread(void) {
     static __thread int done;
@@ -194,11 +197,19 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
 
     atomic_store(&stop_requested, 0);
 
-    struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
-    ill.sa_sigaction = on_ill;
-    sigaction(SIGILL, &ill, &prior_ill);
-    sigaction(SIGBUS, &ill, &prior_bus);
-    sigaction(SIGSEGV, &ill, &prior_segv);
+#ifndef __ANDROID__
+    /* Do not override SIGSEGV/SIGBUS on Android: ART's libsigchain owns SIGSEGV for implicit Java
+       null/stack checks, and debuggerd captures native crash tombstones. On standalone hosts, install
+       once so a second hv_winvm_create() never overwrites prior_* with on_ill itself. */
+    if (!sig_handlers_installed) {
+        struct sigaction ill = {.sa_flags = SA_SIGINFO | SA_ONSTACK};
+        ill.sa_sigaction = on_ill;
+        sigaction(SIGILL, &ill, &prior_ill);
+        sigaction(SIGBUS, &ill, &prior_bus);
+        sigaction(SIGSEGV, &ill, &prior_segv);
+        sig_handlers_installed = 1;
+    }
+#endif
     signal(SIGPIPE, SIG_IGN);
 
     HvDisk *d0_ptr = NULL, *d1_ptr = NULL;
@@ -206,7 +217,7 @@ int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
     int machine_up = 0;
     if (c->disk0 && *c->disk0) {
         if (hv_disk_open(&disk0, c->disk0, 0, 0) != 0) {
-            why = "Cannot open primary NVMe disk image (missing, or locked by another winvm?).";
+            why = "Cannot open primary NVMe disk image (missing, locked, or un-unpacked .hvsparse?).";
             goto fail_out;
         }
         d0_ptr = &disk0;

@@ -162,9 +162,9 @@ $(AB)/libwinvm.a: $(ANDROID_OBJ)
 	rm -f $@
 	$(ANDROID_AR) rcs $@ $(ANDROID_OBJ)
 $(AB)/libwinvm.so: $(ANDROID_OBJ)
-	$(ANDROID_CC) -shared -o $@ $(ANDROID_OBJ) -lEGL -lGLESv3 -landroid -laaudio -llog -lm
+	$(ANDROID_CC) -shared -Wl,-z,max-page-size=16384 -o $@ $(ANDROID_OBJ) -lEGL -lGLESv3 -landroid -laaudio -llog -lm
 $(AB)/libwinvm_jni.so: android/app/src/main/cpp/winvm_jni.c $(AB)/libwinvm.a
-	$(ANDROID_CC) -std=c11 -Wall -Wextra -O2 -g -fPIC -D_GNU_SOURCE -Icore -Ihost -Idevices -shared $< $(AB)/libwinvm.a -lEGL -lGLESv3 -landroid -laaudio -llog -lm -o $@
+	$(ANDROID_CC) -std=c11 -Wall -Wextra -O2 -g -fPIC -D_GNU_SOURCE -fno-sanitize=shadow-call-stack -Wl,-z,max-page-size=16384 -Icore -Ihost -Idevices -shared $< $(AB)/libwinvm.a -lEGL -lGLESv3 -landroid -laaudio -llog -lm -o $@
 
 android-lib: $(AB)/libwinvm.a $(AB)/libwinvm.so $(AB)/libwinvm_jni.so
 

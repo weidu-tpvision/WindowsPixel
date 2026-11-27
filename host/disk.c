@@ -1,12 +1,13 @@
-#include <fcntl.h>
-#include "../core/machine.h"
-#include "disk.h"
-
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include "../core/machine.h"
+#include "disk.h"
 
 int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
     d->fd = open(path, readonly ? O_RDONLY : O_RDWR);
@@ -19,6 +20,16 @@ int hv_disk_open(HvDisk *d, const char *path, uint64_t offset, int readonly) {
     }
     struct stat st;
     if (fstat(d->fd, &st) != 0 || (uint64_t)st.st_size < offset) {
+        if (!readonly) flock(d->fd, LOCK_UN);
+        close(d->fd);
+        d->fd = -1;
+        return -1;
+    }
+    char magic[8] = {0};
+    if ((uint64_t)st.st_size - offset >= 8 && pread(d->fd, magic, 8, (off_t)offset) == 8 &&
+        memcmp(magic, "HVSPARSE", 8) == 0) {
+        fprintf(stderr, "winvm: disk %s is a packed .hvsparse archive; unpack it into a raw .img first!\n", path);
+        if (!readonly) flock(d->fd, LOCK_UN);
         close(d->fd);
         d->fd = -1;
         return -1;
@@ -42,6 +53,7 @@ int hv_disk_read(HvDisk *d, uint64_t off, void *buf, uint64_t len) {
     uint8_t *p = buf;
     while (len) {
         ssize_t n = pread(d->fd, p, len, (off_t)(d->offset + off));
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         p += n;
         off += (uint64_t)n;
@@ -55,6 +67,7 @@ int hv_disk_write(HvDisk *d, uint64_t off, const void *buf, uint64_t len) {
     const uint8_t *p = buf;
     while (len) {
         ssize_t n = pwrite(d->fd, p, len, (off_t)(d->offset + off));
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         p += n;
         off += (uint64_t)n;
@@ -67,18 +80,27 @@ int hv_disk_write(HvDisk *d, uint64_t off, const void *buf, uint64_t len) {
    host runs; 2 fcntl(F_BARRIERFSYNC) on Darwin / fdatasync on Linux/Android. */
 int hv_disk_flush(HvDisk *d) {
     if (d->readonly) return 0;
+    int rc;
     switch (hv_knob[HV_K_FLUSH]) {
     case 1: return 0;
 #ifdef __APPLE__
-    case 2: return fcntl(d->fd, F_BARRIERFSYNC) == -1 ? -1 : 0;
+    case 2:
+        do { rc = fcntl(d->fd, F_BARRIERFSYNC); } while (rc == -1 && errno == EINTR);
+        return rc == -1 ? -1 : 0;
 #else
-    case 2: return fdatasync(d->fd);
+    case 2:
+        do { rc = fdatasync(d->fd); } while (rc == -1 && errno == EINTR);
+        return rc;
 #endif
-    default: return fsync(d->fd);
+    default:
+        do { rc = fsync(d->fd); } while (rc == -1 && errno == EINTR);
+        return rc;
     }
 }
 
 int hv_disk_sync(HvDisk *d) {
     if (d->fd < 0 || d->readonly) return 0;
-    return fsync(d->fd);
+    int rc;
+    do { rc = fsync(d->fd); } while (rc == -1 && errno == EINTR);
+    return rc;
 }

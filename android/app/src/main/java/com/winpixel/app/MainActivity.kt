@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -53,19 +54,29 @@ class MainActivity : ComponentActivity() {
     private var lastTouchY = 0f
     private var downTimeMs = 0L
 
-    private val requestMicPerm = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { /* AAudio handles missing permission gracefully */ }
+    private val requestPerms = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { /* AAudio and notification manager degrade gracefully if denied */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        val missingPerms = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
-            requestMicPerm.launch(Manifest.permission.RECORD_AUDIO)
+            missingPerms.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            missingPerms.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (missingPerms.isNotEmpty()) {
+            requestPerms.launch(missingPerms.toTypedArray())
         }
 
         val machineDir = File(getExternalFilesDir(null), "Machines/Win11").apply { mkdirs() }
@@ -80,6 +91,14 @@ class MainActivity : ComponentActivity() {
                     shareSock = shareSock
                 )
             }
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // HV_FLUSH=1 defers guest NVMe flushes on mobile flash; sync host cache on backgrounding.
+        if (WinVmBridge.nativeIsRunning()) {
+            Thread { WinVmBridge.nativeFlushDisks() }.start()
         }
     }
 
@@ -100,27 +119,41 @@ class MainActivity : ComponentActivity() {
         val scope = rememberCoroutineScope()
         var running by remember { mutableStateOf(WinVmBridge.nativeIsRunning()) }
         var starting by remember { mutableStateOf(false) }
+        var unpacking by remember { mutableStateOf(false) }
+        var unpackPermille by remember { mutableIntStateOf(0) }
         var stopping by remember { mutableStateOf(false) }
         var errorMsg by remember { mutableStateOf<String?>(null) }
         var cpus by remember { mutableIntStateOf(4) }
         var ramMb by remember { mutableIntStateOf(4096) }
         var soundEnabled by remember { mutableStateOf(true) }
         var showToolbar by remember { mutableStateOf(true) }
+        var fsRefreshTick by remember { mutableIntStateOf(0) }
 
         val codeFile = remember(machineDir) { File(machineDir, "code.fd") }
         val varsFile = remember(machineDir) { File(machineDir, "vars.fd") }
-        val diskFile = remember(machineDir) {
-            listOf("windows11.hvsparse", "windows11.img")
-                .map { File(machineDir, it) }
-                .firstOrNull { it.exists() } ?: File(machineDir, "windows11.img")
+        val rawDiskFile = remember(machineDir) { File(machineDir, "windows11.img") }
+        val sparseDiskFile = remember(machineDir) { File(machineDir, "windows11.hvsparse") }
+        val hasRawDisk = remember(machineDir, fsRefreshTick) {
+            rawDiskFile.exists() && rawDiskFile.length() >= (64L shl 20)
         }
-        val disk1File = remember(machineDir) {
+        val needsUnpack = remember(machineDir, fsRefreshTick) {
+            !hasRawDisk && sparseDiskFile.exists()
+        }
+        val disk1File = remember(machineDir, fsRefreshTick) {
             listOf("virtio_net.img", "installer.img")
                 .map { File(machineDir, it) }
                 .firstOrNull { it.exists() }
         }
 
-        val ready = codeFile.exists() && varsFile.exists() && diskFile.exists()
+        val ready = codeFile.exists() && varsFile.exists() && (hasRawDisk || needsUnpack)
+
+        LaunchedEffect(unpacking) {
+            while (unpacking) {
+                val p = WinVmBridge.nativeUnpackProgress()
+                if (p >= 0) unpackPermille = p
+                delay(200)
+            }
+        }
 
         LaunchedEffect(running) {
             while (running) {
@@ -250,10 +283,15 @@ class MainActivity : ComponentActivity() {
                         fontSize = 12.sp,
                         color = Color(0xFF90CAF9)
                     )
+                    val diskLabel = when {
+                        hasRawDisk -> "windows11.img: OK"
+                        needsUnpack -> "windows11.hvsparse: Ready (will unpack on first boot)"
+                        else -> "windows11.img / .hvsparse: Missing"
+                    }
                     Text(
                         "• code.fd: ${if (codeFile.exists()) "OK" else "Missing"}\n" +
                             "• vars.fd: ${if (varsFile.exists()) "OK" else "Missing"}\n" +
-                            "• ${diskFile.name}: ${if (diskFile.exists()) "OK" else "Missing"}\n" +
+                            "• $diskLabel\n" +
                             "• disk1: ${disk1File?.name ?: "None"}",
                         fontFamily = FontFamily.Monospace,
                         fontSize = 13.sp,
@@ -261,7 +299,7 @@ class MainActivity : ComponentActivity() {
                     )
                     if (!ready) {
                         Text(
-                            "Push files via ADB:\nadb push work/code.fd work/vars.fd work/windows11.img ${machineDir.absolutePath}/",
+                            "Push files via ADB:\nadb push work/code.fd work/vars.fd work/windows11.hvsparse ${machineDir.absolutePath}/",
                             fontFamily = FontFamily.Monospace,
                             fontSize = 11.sp,
                             color = Color(0xFFFFCC80)
@@ -289,20 +327,42 @@ class MainActivity : ComponentActivity() {
                         Checkbox(checked = soundEnabled, onCheckedChange = { soundEnabled = it })
                         Text("Enable AAudio Duplex Sound", color = Color.White, fontSize = 13.sp)
                     }
+                    if (unpacking) {
+                        LinearProgressIndicator(
+                            progress = { (unpackPermille / 1000f).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
                     if (errorMsg != null) {
                         Text(errorMsg!!, color = Color(0xFFEF5350), fontSize = 13.sp)
                     }
                     Button(
-                        enabled = ready && !starting,
+                        enabled = ready && !starting && !unpacking,
                         onClick = {
                             errorMsg = null
-                            starting = true
                             scope.launch {
+                                if (!hasRawDisk && sparseDiskFile.exists()) {
+                                    unpacking = true
+                                    unpackPermille = 0
+                                    val unpackErr = withContext(Dispatchers.IO) {
+                                        WinVmBridge.nativeUnpackSparse(
+                                            sparseDiskFile.absolutePath,
+                                            rawDiskFile.absolutePath
+                                        )
+                                    }
+                                    unpacking = false
+                                    fsRefreshTick++
+                                    if (unpackErr != null) {
+                                        errorMsg = unpackErr
+                                        return@launch
+                                    }
+                                }
+                                starting = true
                                 val err = withContext(Dispatchers.IO) {
                                     WinVmBridge.nativeStartVm(
                                         codeFile.absolutePath,
                                         varsFile.absolutePath,
-                                        diskFile.absolutePath,
+                                        rawDiskFile.absolutePath,
                                         disk1File?.absolutePath,
                                         shareDir.absolutePath,
                                         shareSock.absolutePath,
@@ -325,7 +385,12 @@ class MainActivity : ComponentActivity() {
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text(if (starting) "Starting VM..." else "Boot Windows 11 ARM64")
+                        val label = when {
+                            unpacking -> "Unpacking NVMe image (${unpackPermille / 10}%)..."
+                            starting -> "Starting VM..."
+                            else -> "Boot Windows 11 ARM64"
+                        }
+                        Text(label)
                     }
                 }
             }
@@ -406,19 +471,33 @@ class MainActivity : ComponentActivity() {
     }
 
     private val shiftedUsages = HashSet<Int>()
+    private val heldModifiers = HashSet<Int>()
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        when (event.keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP,
+            KeyEvent.KEYCODE_VOLUME_DOWN,
+            KeyEvent.KEYCODE_VOLUME_MUTE -> return super.dispatchKeyEvent(event)
+        }
         if (WinVmBridge.nativeIsRunning()) {
             val down = event.action == KeyEvent.ACTION_DOWN
             val up = event.action == KeyEvent.ACTION_UP
             if (down || up) {
                 val usage = androidKeyToHid(event.keyCode)
                 if (usage != 0) {
-                    // Shift is synthesized around the key it modified; release it on that key's up even
-                    // if the IME already dropped its shift state, or it would stay stuck in the guest.
-                    if (down && event.isShiftPressed && shiftedUsages.add(usage)) WinVmBridge.nativeKeyHid(0xe1, true)
+                    val isMod = usage in 0xe0..0xe7
+                    if (isMod) {
+                        if (down) heldModifiers.add(usage) else heldModifiers.remove(usage)
+                    }
+                    val hwShiftHeld = 0xe1 in heldModifiers || 0xe5 in heldModifiers
+                    // Synthesize Shift for IME events that carry META_SHIFT_ON without a physical Shift key down.
+                    if (!isMod && down && event.isShiftPressed && !hwShiftHeld && shiftedUsages.add(usage)) {
+                        WinVmBridge.nativeKeyHid(0xe1, true)
+                    }
                     WinVmBridge.nativeKeyHid(usage, down)
-                    if (up && shiftedUsages.remove(usage)) WinVmBridge.nativeKeyHid(0xe1, false)
+                    if (!isMod && up && shiftedUsages.remove(usage)) {
+                        WinVmBridge.nativeKeyHid(0xe1, false)
+                    }
                     return true
                 }
             }
@@ -433,9 +512,12 @@ class MainActivity : ComponentActivity() {
         if (keyCode in KeyEvent.KEYCODE_1..KeyEvent.KEYCODE_9) {
             return 0x1e + (keyCode - KeyEvent.KEYCODE_1)
         }
+        if (keyCode in KeyEvent.KEYCODE_F1..KeyEvent.KEYCODE_F12) {
+            return 0x3a + (keyCode - KeyEvent.KEYCODE_F1)
+        }
         return when (keyCode) {
             KeyEvent.KEYCODE_0 -> 0x27
-            KeyEvent.KEYCODE_ENTER -> 0x28
+            KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER -> 0x28
             KeyEvent.KEYCODE_ESCAPE -> 0x29
             KeyEvent.KEYCODE_DEL -> 0x2a
             KeyEvent.KEYCODE_TAB -> 0x2b
@@ -451,10 +533,25 @@ class MainActivity : ComponentActivity() {
             KeyEvent.KEYCODE_COMMA -> 0x36
             KeyEvent.KEYCODE_PERIOD -> 0x37
             KeyEvent.KEYCODE_SLASH -> 0x38
+            KeyEvent.KEYCODE_CAPS_LOCK -> 0x39
+            KeyEvent.KEYCODE_INSERT -> 0x49
+            KeyEvent.KEYCODE_MOVE_HOME -> 0x4a
+            KeyEvent.KEYCODE_PAGE_UP -> 0x4b
+            KeyEvent.KEYCODE_FORWARD_DEL -> 0x4c
+            KeyEvent.KEYCODE_MOVE_END -> 0x4d
+            KeyEvent.KEYCODE_PAGE_DOWN -> 0x4e
             KeyEvent.KEYCODE_DPAD_RIGHT -> 0x4f
             KeyEvent.KEYCODE_DPAD_LEFT -> 0x50
             KeyEvent.KEYCODE_DPAD_DOWN -> 0x51
             KeyEvent.KEYCODE_DPAD_UP -> 0x52
+            KeyEvent.KEYCODE_CTRL_LEFT -> 0xe0
+            KeyEvent.KEYCODE_SHIFT_LEFT -> 0xe1
+            KeyEvent.KEYCODE_ALT_LEFT -> 0xe2
+            KeyEvent.KEYCODE_META_LEFT -> 0xe3
+            KeyEvent.KEYCODE_CTRL_RIGHT -> 0xe4
+            KeyEvent.KEYCODE_SHIFT_RIGHT -> 0xe5
+            KeyEvent.KEYCODE_ALT_RIGHT -> 0xe6
+            KeyEvent.KEYCODE_META_RIGHT -> 0xe7
             else -> 0
         }
     }

@@ -62,6 +62,11 @@ static int open_split(HvJitRegion *region, size_t bytes) {
 
 int hv_jit_region_open(HvJitRegion *region, size_t bytes) {
     memset(region, 0, sizeof *region);
+#ifndef __APPLE__
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t page = ps > 4096 ? (size_t)ps : 4096u;
+    bytes = (bytes + page - 1u) & ~(page - 1u);
+#endif
     if (getenv("HV_JIT_SPLIT")) return open_split(region, bytes);
 #if defined(__APPLE__) && TARGET_OS_OSX
     void *p = mmap(NULL, bytes, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);

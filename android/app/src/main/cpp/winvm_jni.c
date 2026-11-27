@@ -7,10 +7,13 @@
 #include <jni.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "fb_display.h"
+#include "hvsparse.h"
 #include "share.h"
 #include "winvm.h"
 
@@ -24,6 +27,7 @@ static pthread_mutex_t g_op_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_life_mu = PTHREAD_MUTEX_INITIALIZER;
 static ANativeWindow *g_surface_win = NULL;
 static atomic_int g_vm_running = 0;
+static atomic_int g_unpack_permille = -1; /* -1 when idle, 0..1000 while unpacking .hvsparse */
 static int g_display_live = 0; /* under g_life_mu: board.fb is valid to show */
 
 static const char *get_utf(JNIEnv *env, jstring s) {
@@ -114,6 +118,79 @@ Java_com_winpixel_app_WinVmBridge_nativeStopVm(JNIEnv *env, jclass clazz) {
     pthread_mutex_unlock(&g_life_mu);
     hv_winvm_destroy();
     pthread_mutex_unlock(&g_op_mu);
+}
+
+static void unpack_progress_cb(uint64_t done, uint64_t total, void *opaque) {
+    (void)opaque;
+    int p = total ? (int)((done * 1000ull) / total) : 0;
+    if (p < 0) p = 0;
+    if (p > 1000) p = 1000;
+    atomic_store(&g_unpack_permille, p);
+}
+
+JNIEXPORT void JNICALL
+Java_com_winpixel_app_WinVmBridge_nativeFlushDisks(JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    hv_winvm_flush_disks();
+}
+
+JNIEXPORT jint JNICALL
+Java_com_winpixel_app_WinVmBridge_nativeUnpackProgress(JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    return (jint)atomic_load(&g_unpack_permille);
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_winpixel_app_WinVmBridge_nativeUnpackSparse(JNIEnv *env, jclass clazz, jstring j_src, jstring j_dst) {
+    (void)clazz;
+    pthread_mutex_lock(&g_op_mu);
+    if (atomic_load(&g_vm_running)) {
+        pthread_mutex_unlock(&g_op_mu);
+        return (*env)->NewStringUTF(env, "Cannot unpack while VM is running.");
+    }
+    const char *src = get_utf(env, j_src);
+    const char *dst = get_utf(env, j_dst);
+    if (!src || !dst) {
+        if (src) (*env)->ReleaseStringUTFChars(env, j_src, src);
+        if (dst) (*env)->ReleaseStringUTFChars(env, j_dst, dst);
+        pthread_mutex_unlock(&g_op_mu);
+        return (*env)->NewStringUTF(env, "Invalid sparse/destination path.");
+    }
+    size_t tlen = strlen(dst) + 16;
+    char *tmp = malloc(tlen);
+    if (!tmp) {
+        (*env)->ReleaseStringUTFChars(env, j_src, src);
+        (*env)->ReleaseStringUTFChars(env, j_dst, dst);
+        pthread_mutex_unlock(&g_op_mu);
+        return (*env)->NewStringUTF(env, "Out of memory.");
+    }
+    snprintf(tmp, tlen, "%s.unpacking", dst);
+    unlink(tmp);
+    atomic_store(&g_unpack_permille, 0);
+    LOGI("Unpacking %s -> %s", src, dst);
+    int rc = hv_sparse_unpack(src, tmp, unpack_progress_cb, NULL);
+    if (rc == 0) {
+        unlink(dst);
+        if (rename(tmp, dst) == 0) {
+            unlink(src);
+            atomic_store(&g_unpack_permille, 1000);
+        } else {
+            rc = -1;
+        }
+    }
+    if (rc != 0) unlink(tmp);
+    atomic_store(&g_unpack_permille, -1);
+    free(tmp);
+    (*env)->ReleaseStringUTFChars(env, j_src, src);
+    (*env)->ReleaseStringUTFChars(env, j_dst, dst);
+    pthread_mutex_unlock(&g_op_mu);
+    if (rc != 0) {
+        LOGE("hv_sparse_unpack failed");
+        return (*env)->NewStringUTF(env, "Failed to unpack windows11.hvsparse (check free storage space).");
+    }
+    return NULL;
 }
 
 JNIEXPORT void JNICALL

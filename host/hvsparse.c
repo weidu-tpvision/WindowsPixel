@@ -1,5 +1,6 @@
 #include "hvsparse.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,7 @@ static int write_all(int fd, const void *p, size_t n) {
     const uint8_t *b = p;
     while (n) {
         ssize_t w = write(fd, b, n);
+        if (w < 0 && errno == EINTR) continue;
         if (w <= 0) return -1;
         b += w, n -= (size_t)w;
     }
@@ -23,8 +25,31 @@ static int read_all(int fd, void *p, size_t n) {
     uint8_t *b = p;
     while (n) {
         ssize_t r = read(fd, b, n);
+        if (r < 0 && errno == EINTR) continue;
         if (r <= 0) return -1;
         b += r, n -= (size_t)r;
+    }
+    return 0;
+}
+
+static int pread_all(int fd, void *p, size_t n, off_t off) {
+    uint8_t *b = p;
+    while (n) {
+        ssize_t r = pread(fd, b, n, off);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return -1;
+        b += r, off += r, n -= (size_t)r;
+    }
+    return 0;
+}
+
+static int pwrite_all(int fd, const void *p, size_t n, off_t off) {
+    const uint8_t *b = p;
+    while (n) {
+        ssize_t w = pwrite(fd, b, n, off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return -1;
+        b += w, off += w, n -= (size_t)w;
     }
     return 0;
 }
@@ -52,7 +77,7 @@ int hv_sparse_pack_progress(const char *src, const char *dst, void (*progress)(u
         if (hole < 0) hole = (off_t)size;
         for (off_t at = data; at < hole;) {
             size_t n = (size_t)(hole - at < CHUNK ? hole - at : CHUNK);
-            if (pread(in, buf, n, at) != (ssize_t)n) goto done;
+            if (pread_all(in, buf, n, at) != 0) goto done;
             if (!all_zero(buf, n)) {
                 uint64_t rec[2] = {(uint64_t)at, n};
                 if (write_all(out, rec, 16) || write_all(out, buf, n)) goto done;
@@ -64,7 +89,11 @@ int hv_sparse_pack_progress(const char *src, const char *dst, void (*progress)(u
     }
     uint64_t end[2] = {0, 0};
     if (write_all(out, end, 16)) goto done;
-    if (fsync(out) != 0) goto done;
+    {
+        int sr;
+        do { sr = fsync(out); } while (sr == -1 && errno == EINTR);
+        if (sr != 0) goto done;
+    }
     rc = 0;
 done:
     free(buf);
@@ -88,10 +117,10 @@ int hv_sparse_unpack(const char *src, const char *dst, void (*progress)(uint64_t
         if (read_all(in, rec, 16)) goto done;
         if (!rec[1]) break;
         if (rec[1] > CHUNK || rec[0] + rec[1] > size) goto done;
-        if (read_all(in, buf, rec[1]) || pwrite(out, buf, rec[1], (off_t)rec[0]) != (ssize_t)rec[1]) goto done;
+        if (read_all(in, buf, rec[1]) || pwrite_all(out, buf, rec[1], (off_t)rec[0]) != 0) goto done;
         if (progress) progress(rec[0] + rec[1], size, opaque);
     }
-    rc = fsync(out);
+    do { rc = fsync(out); } while (rc == -1 && errno == EINTR);
 done:
     free(buf);
     if (in >= 0) close(in);
