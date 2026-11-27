@@ -315,6 +315,31 @@ Closer inspection of the counters from `work/winvm_stats3.log` against `core/mmu
 
 ---
 
+## Performance Note: PowerShell & Windows Terminal
+
+PowerShell (`powershell.exe` / `pwsh.exe`) and Windows Terminal (`WindowsTerminal.exe`) can feel noticeably slower than native Win32 apps on `WindowsPixel` for three reasons:
+
+1. **Nested JIT (.NET CLR inside the ARM64 JIT) — `hv_invalidate_code()` storms:**
+   PowerShell + `PSReadLine` run on .NET CLR, which JIT-compiles many small IL methods into the same 4 KB pages. Once our JIT translates one method on a 4 KB page, `ram->code_pages[pg] = 1` (`core/dispatch.c`) write-protects that page across all vCPUs. When .NET compiles the next method or patches a stub in the same 4 KB page, every write traps to `hv_invalidate_code()` (`core/machine.c`), which drops all translated blocks on that page, resets **both** user and kernel indirect-branch caches (`hv_ijc_reset`) on every vCPU, and kicks all vCPUs out of their chained blocks.
+2. **Windows Terminal renders via Direct3D/Direct2D on WARP (CPU software GPU):**
+   With `ramfb` / `BasicDisplay.sys` (no virtual GPU), `WindowsTerminal.exe` rasterizes every keystroke, scroll, transparency effect, and blinking cursor through Direct3D 11 / Direct2D on Microsoft's CPU software rasterizer (WARP).
+3. **AMSI / Defender scanning + synchronous NVMe I/O:**
+   PowerShell startup and module loads trigger AMSI (`MsMpEng.exe`) and bursts of small disk reads/flushes, which currently execute synchronously under `dev_mu` on vCPU threads.
+
+### Quick triage to identify the dominant bottleneck
+
+Compare typing/running `dir` inside Windows across three setups:
+1. **`conhost.exe cmd.exe`** (Win+R $\to$ `conhost cmd`) — no .NET JIT, no Direct2D/WARP.
+2. **`conhost.exe powershell.exe -NoProfile`** — .NET JIT, no Windows Terminal WARP.
+3. **Windows Terminal** — both.
+
+With `--stats 5` running:
+- High `flushes .../s (smc ...)` and `cache drops/s: ... code ...` $\to$ **#1 (.NET nested JIT / `hv_invalidate_code()` wiping every vCPU's IJC)**.
+- High `translated .../s` + `translation lock ...%` $\to$ `tr_mu` contention from .NET compiling new blocks.
+- Fast `conhost powershell` vs sluggish Windows Terminal $\to$ **#2 (WARP software rendering)**; disabling transparency/acrylic and cursor blink in Windows Terminal Settings (or using `conhost`) avoids it immediately.
+
+---
+
 ## Appendix: How the Repo Works
 
 ### What it is
