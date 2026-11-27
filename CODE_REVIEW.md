@@ -287,12 +287,31 @@ One "freeze" during testing (a dark screen with a moving pointer) turned out **n
   - the restart then completed cleanly ("guest requested PSCI SYSTEM_RESET — rebooting...") and Windows booted normally.
 - **Lesson:** "screen dark, mouse moves" is not a reliable freeze signal. Check whether the vCPU threads are spinning (the `bt` state dump) and the exception rate in the stats.
 
-### Next steps
+### Root-cause analysis & fixes applied (2026-11-27)
 
-1. Reproduce with the detector in place: `./scripts/trace_freeze.sh run`. Memory pressure (Edge with several tabs, Store, Settings at around 4.5 GB) makes it more likely. Read the `FAULT LOOP` block in `work/winvm_stats3.log`.
-2. Repeat with `HV_FAULT_LOOP_FLUSH=1` to tell stale-state bugs from walker or guest problems.
-3. Decode the faulting instruction (an unprivileged `LDTR*`? an atomic? a pair?) and check its path in `translate.c`/`memop.c`, especially how unprivileged and PAN accesses choose the TLB table.
-4. Independent of the freeze, run NVMe I/O off the vCPU thread and outside `dev_mu`: each flush stalls all device access for up to 16 ms. Also look at the translation-lock contention.
+Closer inspection of the counters from `work/winvm_stats3.log` against `core/mmu.c` and `core/sysreg.c` pinpoints how the livelock occurs:
+
+1. **What the 2:1 `exceptions` vs `slow_why[5]` ratio proves:**
+   - During the freeze, `exceptions` ran at **2,450K/s**, `SVC/ERET resumed in place` at **4.2M/s** (~800 ns per full fault + `MmAccessFault` + `ERET` round-trip), and `slow_why[5]` (`entry-but-tag`) ran at **1,181K/s** — almost Move-for-Move **half** of `2,450K/s` (`96.4%`).
+   - In `hv_tlb_refill()` (`core/mmu.c`), `slow_why[5]` is incremented via `last_refill_key` when the **exact same `(va, flags)`** misses twice in a row with **zero intervening `hv_tlb_refill()` calls** (`Fault #1` sets `last_refill_key = rkey`; `Fault #2` sees `last_refill_key == rkey`, resets it to `0`, and bumps `slow_why[5]++`).
+   - That 2:1 ping-pong proves two things simultaneously:
+     1. Inside `MmAccessFault(0x150f204)`, Windows took **zero software-TLB misses** on 96%+ of iterations: every read `MmAccessFault` made to inspect its self-referential page tables (`MmPteBase`, `0xFFFFF680...` in `TTBR1_EL1`) **hit in `cpu->tlb[1]`**.
+     2. At ~800 ns per round-trip, `MmAccessFault` was taking its lock-free *"PTE/PDE/PPE already valid $\to$ spurious TLB fault $\to$ `return STATUS_SUCCESS`"* early exit after reading `MmPteBase` through `cpu->tlb[1]`, while `hv_mmu_walk()` walking guest physical RAM from `cpu->ttbr0_el1` saw `L1` (`DFSC 0x05`) or `L2` (`DFSC 0x06`) invalid.
+
+2. **Two engine bugs that produce that exact mismatch (both now fixed):**
+   - **Bug A — Unsynchronized SMP remote `TLBI` shootdown (`hv_tlbi_drop_remote_va` in `core/mmu.c`, fixed in `1dfbb4b`):**
+     Under heavy RAM pressure (94% of 4.5 GB) or during Start $\to$ Shut down (mass process teardown across 4 vCPUs), Windows's working-set trimmer constantly unmaps user pages and **reclaims L3/L2 page-table pages**, unmapping both the user VA and the self-map `MmPteBase` kernel VA (`0xFFFFF680...`) and issuing `TLBI ... IS` + `DSB ISH`.
+     Previously, `hv_tlbi_drop_remote_va()` wrote `HV_TLB_INVALID` to `target->tlb` and **returned `1` immediately without waiting for `target`**, even while `target->pc_state->tlb_live == 1` (and even when `fetched == 1`, it only called `hv_cpu_kick()` without `hv_cpu_sync()`). A remote vCPU that had *just* passed its inline `CBNZ U` TLB tag check in JIT code (especially if preempted by the Linux host scheduler for a few microseconds before the host load/store/atomic) completed its memory operation against the **old physical page** *after* `TLBI ... IS` + `DSB ISH` had returned and Windows recycled/reallocated that page as a page table or MM structure.
+     **Fix:** `hv_tlbi_drop_remote_va()` now checks low-56-bit tag matches (avoiding false conflict evictions on remote vCPUs) and returns `-1` whenever `target` holds `va` in its live `cpu->tlb` or active IJC, forcing `hv_cpu_post_tlbi` + `hv_cpu_sync` so `target` exits its translated block and retires all in-flight inline TLB accesses before `TLBI ... IS` completes.
+   - **Bug B — `va + len` wraparound at $2^{64}$ / $2^{56}$ on top-of-`TTBR1` range `TLBI`s (`core/mmu.c`, `core/sysreg.c`):**
+     In both `hv_tlbi_apply()` (`p < va + len`) and `hv_tlb_flush_kernel_range()` (`p < va + len` for $\le 16\text{ MB}$ ranges, and `hi = (va + len) & 0x00ffffffffffffffull` for $> 16\text{ MB}$ ranges), any kernel `TLBI RVAE1IS` reaching the top of the 64-bit address space (`va + len == 0` modulo $2^{64}$) wrapped the upper bound to **`0`**, turning `p < 0` / `pg < 0` into a **silent no-op** and leaving stale `TTBR1` kernel TLB entries behind in `cpu->tlb[1]`.
+     **Fix:** Rewrote both range loops and the big-range `[lo, hi)` bounds in terms of `span = (va - first) + len` and `hi = lo + span` (`lo < 2^{56}`, `span <= 2^{37}`), eliminating 64-bit and 56-bit wraparound completely (covered by unit tests in `tests/test_mmu.c`).
+
+### Verification steps on DGX Spark
+
+1. Run `./scripts/trace_freeze.sh run` (or `HV_FAULT_LOOP_FLUSH=1 ./scripts/trace_freeze.sh run`) under heavy memory pressure (Edge with multiple tabs, Store, Settings at 4.5 GB, followed by Start $\to$ Shut down) to confirm the livelock no longer reproduces with both fixes in place.
+2. If `FAULT LOOP` ever triggers again, the built-in detector in `core/exception.c` logs the exact faulting instruction word, `TTBR0`/`TTBR1`, L0–L3 physical descriptors, and whether `HV_FAULT_LOOP_FLUSH=1` (`TLBI VMALLE1`) clears it.
+3. Independent of correctness, moving NVMe `pread`/`pwrite`/`fsync` off vCPU threads (`dev_mu`) and reducing `tr_mu` contention remain worthwhile throughput optimizations.
 
 ---
 

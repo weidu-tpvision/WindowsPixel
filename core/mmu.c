@@ -406,11 +406,13 @@ void hv_tlb_flush_user_range(HvCpu *cpu, uint64_t va, uint64_t len) {
 void hv_tlb_flush_kernel_range(HvCpu *cpu, uint64_t va, uint64_t len) {
     if (cpu->m && cpu->m->stats_interval) cpu->m->stats.kernel_ranges++;
     uint64_t first = va & ~(uint64_t)PAGE_MASK;
-    if (len <= (4096ull << HV_TLB_PAGE_BITS)) {
-        for (uint64_t p = first; p < va + len; p += 1ull << HV_TLB_PAGE_BITS) hv_tlb_flush_va_asid(cpu, p, -1);
+    uint64_t span = (va - first) + len;
+    if (span <= (4096ull << HV_TLB_PAGE_BITS)) {
+        for (uint64_t off = 0; off < span; off += 1ull << HV_TLB_PAGE_BITS)
+            hv_tlb_flush_va_asid(cpu, first + off, -1);
         return;
     }
-    uint64_t lo = first & 0x00ffffffffffffffull, hi = (va + len) & 0x00ffffffffffffffull; /* tagged addresses: by the low 56 bits */
+    uint64_t lo = first & 0x00ffffffffffffffull, hi = lo + span; /* tagged addresses: low 56 bits without wrapping at 2^56 */
     for (int t = 0; t < 3; t++)
         for (uint32_t i = 0; i < HV_TLB_SIZE; i++) {
             HvTlbEntry *e = hv_tlb_ent(cpu, i, t);

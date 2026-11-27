@@ -240,6 +240,26 @@ int main(void) {
                 failures++;
             }
         }
+        /* Top-of-TTBR1 range ending at 2^64 (va + len wraps to 0): both small (64 pages) and large (8192 pages)
+           kernel TLBI RVAE1IS must still drop entries at 0xfffffffffffff000 without wrapping `va + len` to 0. */
+        static const struct { uint32_t scale, num, pages; } top_ranges[2] = {{1, 0, 64}, {2, 3, 8192}};
+        for (int r = 0; r < 2; r++) {
+            hv_tlb_flush(&cpu);
+            uint64_t top_base = 0ull - ((uint64_t)top_ranges[r].pages << HV_TLB_PAGE_BITS);
+            uint64_t last_pg  = 0xfffffffffffff000ull;
+            HvTlbEntry *te = hv_tlb_ent(&cpu, (last_pg >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1), 1);
+            te->read_tag = last_pg - HV_TLB_ADJ;
+            te->addend = 0;
+            cpu.el = 1;
+            cpu.x[1] = 1ull << 46 | (uint64_t)top_ranges[r].scale << 44 | (uint64_t)top_ranges[r].num << 39 |
+                       ((top_base >> 12) & 0x1fffffffffull);
+            hv_sysreg_sys(&cpu, 0xd5088221u, 0); /* tlbi rvae1is, x1 */
+            checks++;
+            if (te->read_tag != HV_TLB_INVALID) {
+                printf("  FAIL top-of-TTBR1 range (%u pages) missed 0xfffffffffffff000 on 2^64 wrap\n", top_ranges[r].pages);
+                failures++;
+            }
+        }
     }
 
     /* A TLBI by VA and ASID forgets the indirect-branch cache entries of that page

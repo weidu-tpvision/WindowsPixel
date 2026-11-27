@@ -424,8 +424,9 @@ void hv_tlbi_apply(HvCpu *cpu, uint32_t op1, uint32_t crn, uint32_t crm, uint32_
             }
         } else {
             uint64_t first = va & ~((1ull << HV_TLB_PAGE_BITS) - 1);
-            for (uint64_t p = first; p < va + len; p += 1ull << HV_TLB_PAGE_BITS)
-                hv_tlb_flush_va_asid(cpu, p, all_asids ? -1 : tasid);
+            uint64_t span = (va - first) + len;
+            for (uint64_t off = 0; off < span; off += 1ull << HV_TLB_PAGE_BITS)
+                hv_tlb_flush_va_asid(cpu, first + off, all_asids ? -1 : tasid);
         }
         return;
     }
