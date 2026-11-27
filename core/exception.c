@@ -166,6 +166,42 @@ static void fault_loop_report(HvCpu *cpu, uint64_t va, uint32_t fsc, int insn, u
     fprintf(stderr, "    daif %llx pstate_extra %llx (PAN %d) spsr %llx elr %llx\n", (unsigned long long)cpu->daif,
             (unsigned long long)cpu->pstate_extra, (int)((cpu->pstate_extra >> 22) & 1),
             (unsigned long long)cpu->spsr_el1, (unsigned long long)cpu->elr_el1);
+    fprintf(stderr, "    code around pc:");
+    for (int off = -16; off <= 12; off += 4) {
+        uint32_t w = 0;
+        uint64_t a = pc + (uint64_t)(int64_t)off, pa;
+        if (!hv_mmu_access(cpu, a, HV_ACC_EXEC, cpu->el, &pa) && !hv_phys_read(cpu->m, pa, &w, 4))
+            fprintf(stderr, " %s%08x", off == 0 ? "*" : "", w);
+        else
+            fprintf(stderr, " %s????????", off == 0 ? "*" : "");
+    }
+    fprintf(stderr, "\n    x0..x7:  %llx %llx %llx %llx %llx %llx %llx %llx\n",
+            (unsigned long long)cpu->x[0], (unsigned long long)cpu->x[1], (unsigned long long)cpu->x[2],
+            (unsigned long long)cpu->x[3], (unsigned long long)cpu->x[4], (unsigned long long)cpu->x[5],
+            (unsigned long long)cpu->x[6], (unsigned long long)cpu->x[7]);
+    fprintf(stderr, "    x8..x15: %llx %llx %llx %llx %llx %llx %llx %llx\n",
+            (unsigned long long)cpu->x[8], (unsigned long long)cpu->x[9], (unsigned long long)cpu->x[10],
+            (unsigned long long)cpu->x[11], (unsigned long long)cpu->x[12], (unsigned long long)cpu->x[13],
+            (unsigned long long)cpu->x[14], (unsigned long long)cpu->x[15]);
+    fprintf(stderr, "    sp %llx fp %llx lr %llx\n",
+            (unsigned long long)cpu->sp, (unsigned long long)cpu->x[29], (unsigned long long)cpu->x[30]);
+    if (cpu->el == 1 && ((cpu->x[0] >> 55) & 1) && (cpu->x[0] & 7) == 0) {
+        uint64_t q[2] = {0, 0}, xpa;
+        if (!hv_mmu_access(cpu, cpu->x[0], HV_ACC_READ, 1, &xpa) && !hv_phys_read(cpu->m, xpa, q, 16))
+            fprintf(stderr, "    [x0]: %016llx %016llx\n", (unsigned long long)q[0], (unsigned long long)q[1]);
+    }
+    if (cpu->el == 1) {
+        fprintf(stderr, "    backtrace: lr %llx", (unsigned long long)cpu->x[30]);
+        uint64_t fp = cpu->x[29];
+        for (int i = 0; i < 12 && ((fp >> 55) & 1); i++) {
+            uint64_t fr[2], fpa;
+            if (hv_mmu_access(cpu, fp, HV_ACC_READ, 1, &fpa) || hv_phys_read(cpu->m, fpa, fr, 16)) break;
+            fprintf(stderr, " %llx", (unsigned long long)fr[1]);
+            if (fr[0] <= fp) break;
+            fp = fr[0];
+        }
+        fprintf(stderr, "\n");
+    }
     dump_walk(cpu, va);
     for (int el = 1; el >= 0; el--) {
         HvWalk w;
