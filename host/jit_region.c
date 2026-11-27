@@ -139,7 +139,15 @@ void hv_jit_finish(HvJitRegion *region, uint32_t *start, size_t words) {
 #ifdef __APPLE__
         sys_icache_invalidate(start, words * sizeof(uint32_t));
 #else
-        __builtin___clear_cache((char *)start, (char *)(start + words));
+        char *rx = (char *)start;
+        size_t bytes = words * sizeof(uint32_t);
+        if (region->rw_diff) {
+            /* Dual-mapped memfd: clean dirty D-cache lines on the writable alias
+               to PoU before invalidating I-cache lines on the executable view. */
+            char *rw = rx + region->rw_diff;
+            __builtin___clear_cache(rw, rw + bytes);
+        }
+        __builtin___clear_cache(rx, rx + bytes);
 #endif
     }
 }

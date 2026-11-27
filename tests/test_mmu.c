@@ -369,6 +369,59 @@ int main(void) {
         }
     }
 
+    /* SMP remote TLBI (hv_tlbi_drop_remote_va + TLBI VAE1IS broadcast):
+       1. Unrelated page on CPU 1 sharing the same TLB index is NOT evicted and completes locklessly.
+       2. Matching page on CPU 1 returns -1 from hv_tlbi_drop_remote_va so TLBI VAE1IS posts + syncs
+          and CPU 1 flushes the entry before resuming guest execution. */
+    {
+        static HvCpu cpu1;
+        hv_cpu_reset_index(&cpu, &m, 0);
+        hv_cpu_reset_index(&cpu1, &m, 1);
+        cpu.el = 1;
+        cpu1.el = 1;
+
+        uint64_t target_va = 0x100004000ull;
+        uint64_t other_va  = target_va + ((uint64_t)HV_TLB_SIZE << HV_TLB_PAGE_BITS); /* same TLB index, different VA */
+        uint32_t sl = (target_va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
+
+        /* Case 1: CPU 1 holds `other_va` at the same index -> preserved, no post needed. */
+        HvTlbEntry *e1 = hv_tlb_ent(&cpu1, sl, 0);
+        e1->read_tag = other_va - HV_TLB_ADJ;
+        e1->addend = 0x2000;
+        uint64_t req_before = m.percpu[1].req_seq;
+        int r_other = hv_tlbi_drop_remote_va(&cpu1, target_va, 5);
+        checks++;
+        if (r_other != 1 || e1->read_tag != other_va - HV_TLB_ADJ || m.percpu[1].req_seq != req_before) {
+            printf("  FAIL remote TLBI evicted or posted for an unrelated page sharing TLB index (r=%d)\n", r_other);
+            failures++;
+        }
+
+        /* Case 2: CPU 1 holds `target_va` -> hv_tlbi_drop_remote_va returns -1, TLBI VAE1IS posts,
+           and hv_cpu_process_requests on CPU 1 flushes the entry. */
+        e1->read_tag = target_va - HV_TLB_ADJ;
+        int r_hit = hv_tlbi_drop_remote_va(&cpu1, target_va, 5);
+        checks++;
+        if (r_hit != -1) {
+            printf("  FAIL hv_tlbi_drop_remote_va did not request sync (-1) when target held VA (r=%d)\n", r_hit);
+            failures++;
+        }
+        cpu.x[1] = (5ull << 48) | ((target_va >> 12) & 0xfffffffffffull);
+        hv_sysreg_sys(&cpu, 0xd5088321u, 0); /* tlbi vae1is, x1 (cpu1 has !tlb_live, so sync returns immediately) */
+        checks++;
+        if (m.percpu[1].req_seq == req_before || !cpu1.exit_req) {
+            printf("  FAIL TLBI VAE1IS did not post request + exit_req to CPU 1 holding VA\n");
+            failures++;
+        }
+        hv_cpu_process_requests(&cpu1);
+        checks++;
+        if (e1->read_tag != HV_TLB_INVALID) {
+            printf("  FAIL CPU 1 hv_cpu_process_requests did not flush posted TLBI VAE1IS\n");
+            failures++;
+        }
+        m.cpus[1] = NULL;
+        m.ncpus = 1;
+    }
+
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
 }

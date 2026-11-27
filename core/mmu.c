@@ -517,6 +517,7 @@ static int ijc_drop_va(HvCpu *cpu, uint64_t va, int asid, int remote) {
             drop = (salt >> 48) && ucode_has(p, (uint32_t)(salt >> 48), va);
         }
         if (drop) {
+            if (remote && __atomic_load_n(&p->tlb_live, __ATOMIC_SEQ_CST)) return 0;
             if (remote && !kernel && asid < 0) return 0;
             if (remote && kernel && __atomic_load_n(&cpu->kttbr_count, __ATOMIC_RELAXED) > 1) return 0;
             m->stats.reset_why[kernel ? 3 : 2]++;
@@ -782,15 +783,23 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     uint32_t c1 = __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST);
     if (c1 & 1) { if (target->m->stats_interval) target->m->stats.race_kind[1]++; return 0; } /* caching a block it may have looked up through the old mapping */
     if (!((va >> 55) & 1)) stash_drop(p, asid);
+    const uint64_t pmask = 0x00ffffffffffffffull & ~PAGE_MASK;
     uint32_t idx = (va >> HV_TLB_PAGE_BITS) & (HV_TLB_SIZE - 1);
-    int fetched = 0; /* the target may be running code from the page: it must leave and look again */
-    for (int t = 0; t < 3; t++) { /* the slot whatever its tag byte, as hv_tlb_flush_va_asid does */
+    for (int t = 0; t < 3; t++) { /* check by the low 56 bits so TBI-tagged entries match */
         HvTlbEntry *e = hv_tlb_ent(target, idx, t);
+        uint64_t r = __atomic_load_n(&e->read_tag, __ATOMIC_RELAXED);
+        uint64_t w = __atomic_load_n(&e->write_tag, __ATOMIC_RELAXED);
         uint64_t x = __atomic_load_n(&e->exec_tag, __ATOMIC_RELAXED);
-        if (x != HV_TLB_INVALID && ((hv_exec_key(x, e->addend) ^ va) & (0x00ffffffffffffffull & ~PAGE_MASK)) == 0) fetched = 1;
-        __atomic_store_n(&e->read_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
-        __atomic_store_n(&e->write_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
-        __atomic_store_n(&e->exec_tag, HV_TLB_INVALID, __ATOMIC_RELAXED);
+        int64_t a = __atomic_load_n(&e->addend, __ATOMIC_RELAXED);
+        if ((r != HV_TLB_INVALID && (((r + HV_TLB_ADJ) ^ va) & pmask) == 0) ||
+            (w != HV_TLB_INVALID && (((w + HV_TLB_ADJ) ^ va) & pmask) == 0) ||
+            (x != HV_TLB_INVALID && ((hv_exec_key(x, a) ^ va) & pmask) == 0)) {
+            /* Target holds `va` in its live TLB: post the TLBI and synchronize
+               (hv_cpu_post_tlbi + hv_cpu_sync) so any in-flight inline TLB access
+               or code block on target retires before TLBI ... IS completes (returns
+               immediately without waiting if target is parked with !tlb_live). */
+            return -1;
+        }
     }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     /* Its cached branch targets in the page too: a cache fill checks the TLB
@@ -800,11 +809,7 @@ int hv_tlbi_drop_remote_va(HvCpu *target, uint64_t va, int asid) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     int ok = __atomic_load_n(&p->walk_seq, __ATOMIC_SEQ_CST) == s1 && /* no fill in between */
              __atomic_load_n(&p->ijc_seq, __ATOMIC_SEQ_CST) == c1;
-    if (!ok) {
-        if (target->m->stats_interval) target->m->stats.race_kind[2]++;
-    } else if (fetched) {
-        hv_cpu_kick(target);
-    }
+    if (!ok && target->m->stats_interval) target->m->stats.race_kind[2]++;
     return ok;
 }
 

@@ -16,9 +16,13 @@ static int one(const char *what) {
     hv_jit_finish(&region, code, 2);
     long (*fn)(void) = (long (*)(void))code;
     long got = fn();
-    printf("%s: jit region returned %ld\n", what, got);
+    static const uint32_t body2[2] = {0xd2800c60, 0xd65f03c0}; /* mov x0, #99; ret (rewrite over hot I-cache line) */
+    hv_jit_write(&region, code, body2, sizeof body2);
+    hv_jit_finish(&region, code, 2);
+    long got2 = fn();
+    printf("%s: jit region returned %ld then %ld\n", what, got, got2);
     hv_jit_region_close(&region);
-    return got != 42;
+    return got != 42 || got2 != 99;
 }
 
 int main(void) {

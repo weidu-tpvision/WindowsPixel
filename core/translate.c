@@ -1573,9 +1573,14 @@ static int translate_sysreg_inline(Emit *e, uint32_t insn, uint64_t pc) {
         if (!read) return 0;
         if (rt == 31) return 1;
         int r = is_stolen(rt) ? 15 : rt;
+#ifdef __APPLE__
         put(e, 0xd53be040u | (uint32_t)r);                        /* mrs xr, cntvct_el0 */
-#ifndef __APPLE__
+#else
         if (!hv_cnt_mult) hv_counter_ensure_init();
+        put(e, 0xd5033fdfu);                                      /* isb */
+        put(e, 0xd53be040u | (uint32_t)r);                        /* mrs xr, cntvct_el0 */
+        put_lit(e, 6, hv_cnt_base);
+        put(e, SUB_X(r, r, 6));                                   /* sub xr, xr, x6 */
         if (hv_cnt_mult != (1ull << 60)) {
             put_lit(e, 6, hv_cnt_mult);
             put(e, 0x9b067c00u | (uint32_t)r << 5 | 7u);          /* mul x7, xr, x6 */
