@@ -215,3 +215,12 @@ HvFwCfg *hv_fw_cfg_create(HvMachine *m, uint64_t pa, uint16_t ncpus) {
     hv_machine_add_mmio(m, pa, 0x1000, fc, fw_cfg_read, fw_cfg_write, "fw_cfg");
     return fc;
 }
+
+void hv_fw_cfg_destroy(HvFwCfg *fc) {
+    if (!fc) return;
+    free(fc->dir_blob);
+    for (int i = 0; i < fc->nfiles; i++) {
+        free(fc->files[i].data);
+    }
+    free(fc);
+}

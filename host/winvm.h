@@ -37,6 +37,7 @@ void hv_winvm_flush_disks(void);
 /* Display & screenshot hooks (any thread) */
 void hv_winvm_set_display_layer(void *ca_metal_layer);
 int hv_winvm_display_size(uint32_t *w, uint32_t *h);
+int hv_winvm_copy_frame_bgrx(uint8_t **buf, size_t *cap, uint32_t *w, uint32_t *h);
 uint64_t hv_winvm_display_frames(void);
 int hv_winvm_save_png(const char *path);
 

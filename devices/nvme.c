@@ -614,3 +614,10 @@ HvNvme *hv_nvme_create(HvMachine *m, HvPcie *bus, HvDisk *disk, const char *seri
     hv_pcie_attach(bus, &nv->pci);
     return nv;
 }
+
+void hv_nvme_destroy(HvNvme *nv) {
+    if (!nv) return;
+    free(nv->io_buf);
+    pthread_mutex_destroy(&nv->mu);
+    free(nv);
+}

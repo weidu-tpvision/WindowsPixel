@@ -47,6 +47,21 @@ static char agent_path[PATH_MAX];
 
 static pthread_mutex_t clip_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t clip_cond = PTHREAD_COND_INITIALIZER;
+#ifndef __APPLE__
+static pthread_once_t clip_cond_once = PTHREAD_ONCE_INIT;
+static void init_clip_cond_monotonic(void) {
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    pthread_cond_init(&clip_cond, &ca);
+    pthread_condattr_destroy(&ca);
+}
+static void ensure_clip_cond(void) {
+    pthread_once(&clip_cond_once, init_clip_cond_monotonic);
+}
+#else
+static void ensure_clip_cond(void) {}
+#endif
 static char *device_clip; /* the device's, for the guest */
 static unsigned long device_seq;
 static char *guest_clip; /* the guest's, until the device takes it */
@@ -105,6 +120,7 @@ int hv_share_take_oauth_done(void) {
 }
 
 void hv_share_set_clipboard(const char *text) {
+    ensure_clip_cond();
     pthread_mutex_lock(&clip_mu);
     free(device_clip);
     device_clip = strdup(text);
@@ -202,7 +218,11 @@ static void add_url(Text *t, const char *s) {
 static int send_all(int fd, const void *p, size_t n) {
     const char *c = p;
     while (n) {
+#ifdef MSG_NOSIGNAL
+        ssize_t w = send(fd, c, n, MSG_NOSIGNAL);
+#else
         ssize_t w = send(fd, c, n, 0);
+#endif
         if (w < 0 && errno == EINTR) continue;
         if (w <= 0) return -1;
         c += w, n -= (size_t)w;
@@ -781,11 +801,17 @@ static int clipboard_get(Conn *c, Request *r) {
     unsigned long since = 0;
     const char *q = strstr(r->query, "since=");
     if (q) since = strtoul(q + 6, NULL, 10);
+    ensure_clip_cond();
     struct timespec until;
+#ifdef __APPLE__
     struct timeval now;
     gettimeofday(&now, NULL);
     until.tv_sec = now.tv_sec + 25;
     until.tv_nsec = now.tv_usec * 1000;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &until);
+    until.tv_sec += 25;
+#endif
     pthread_mutex_lock(&clip_mu);
     agent_seen = time(NULL);
     while (device_seq <= since && pthread_cond_timedwait(&clip_cond, &clip_mu, &until) != ETIMEDOUT) {}
@@ -1049,7 +1075,16 @@ static void *listener(void *arg) {
 
 int hv_share_start(const char *folder, const char *socket_path, const char *agent) {
     static int started;
-    if (started) return 0;
+    if (started) {
+        char updated[PATH_MAX];
+        if (folder && realpath(folder, updated)) {
+            pthread_mutex_lock(&clip_mu);
+            snprintf(root, sizeof root, "%s", updated);
+            if (agent) snprintf(agent_path, sizeof agent_path, "%s", agent);
+            pthread_mutex_unlock(&clip_mu);
+        }
+        return 0;
+    }
     if (!realpath(folder, root)) return -1;
     if (agent) snprintf(agent_path, sizeof agent_path, "%s", agent);
     struct sockaddr_un addr = {.sun_family = AF_UNIX};

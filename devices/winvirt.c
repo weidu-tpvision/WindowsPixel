@@ -69,6 +69,7 @@ uint8_t *hv_alloc_no_footprint(uint64_t size) {
 struct PrefaultArgs {
     uint8_t *ram;
     uint64_t size;
+    int *stop;
 };
 
 static void *prefault_thread(void *arg) {
@@ -77,8 +78,10 @@ static void *prefault_thread(void *arg) {
 #ifdef __APPLE__
     pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #endif
-    for (uint64_t off = 0; off < a.size; off += 0x1000)
+    for (uint64_t off = 0; off < a.size; off += 0x1000) {
+        if ((off & 0xffffffULL) == 0 && __atomic_load_n(a.stop, __ATOMIC_RELAXED)) break;
         __atomic_fetch_add((volatile uint64_t *)(a.ram + off), 0, __ATOMIC_RELAXED);
+    }
     return NULL;
 }
 
@@ -155,8 +158,8 @@ int hv_winvirt_create(HvWinVirt *b, HvMachine *m, HvCpu *cpu, int ncpus, uint64_
             if (a) {
                 a->ram = b->ram;
                 a->size = ram_size;
-                pthread_t t;
-                if (pthread_create(&t, NULL, prefault_thread, a) == 0) pthread_detach(t);
+                a->stop = &b->prefault_stop;
+                if (pthread_create(&b->prefault_tid, NULL, prefault_thread, a) == 0) b->prefault_started = 1;
                 else free(a);
             }
         }
@@ -259,25 +262,46 @@ void hv_winvirt_power_button(HvWinVirt *b) {
 
 void hv_winvirt_destroy(HvWinVirt *b) {
     if (!b) return;
+    if (b->prefault_started) {
+        __atomic_store_n(&b->prefault_stop, 1, __ATOMIC_RELAXED);
+        pthread_join(b->prefault_tid, NULL);
+        b->prefault_started = 0;
+    }
     hv_pflash_close(b->flash0);
     hv_pflash_close(b->flash1);
     if (b->ram_owned && b->ram && b->ram != MAP_FAILED) {
         munmap(b->ram, b->ram_size);
     }
     free(b->dtb);
-    free(b->gic);
+    if (b->gic) {
+        pthread_mutex_destroy(&b->gic->mu);
+        free(b->gic);
+    }
     free(b->its);
     free(b->uart);
     free(b->rtc);
     free(b->gpio);
-    free(b->fw_cfg);
-    free(b->fb);
+    hv_fw_cfg_destroy(b->fw_cfg);
+    if (b->fb) {
+        pthread_mutex_destroy(&b->fb->mu);
+        free(b->fb);
+    }
     free(b->pcie);
     free(b->net);
-    free(b->nvme0);
-    free(b->nvme1);
-    free(b->usb);
-    free(b->hda);
-    free(b->snd);
+    hv_nvme_destroy(b->nvme0);
+    hv_nvme_destroy(b->nvme1);
+    if (b->usb) {
+        pthread_mutex_destroy(&b->usb->mu);
+        free(b->usb);
+    }
+    if (b->hda) {
+        free(b->hda->tx_ring);
+        free(b->hda->rx_ring);
+        free(b->hda);
+    }
+    if (b->snd) {
+        free(b->snd->ring);
+        free(b->snd);
+    }
     memset(b, 0, sizeof *b);
 }

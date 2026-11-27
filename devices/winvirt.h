@@ -61,6 +61,9 @@ typedef struct HvWinVirt {
     uint8_t *ram;
     uint64_t ram_size;
     int ram_owned;
+    pthread_t prefault_tid;
+    int prefault_started;
+    int prefault_stop;
     uint8_t *dtb;
     size_t dtb_size;
 

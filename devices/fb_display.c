@@ -39,7 +39,7 @@ static void on_ramfb_write(void *opaque, const uint8_t *data, uint32_t len) {
 
     if (width < 64 || width > 8192 || height < 64 || height > 8192) return;
     if (stride == 0) stride = width * 4;
-    if (stride < width * 2 || stride > 65536) return;
+    if (stride < width * 4 || stride > 65536) return;
 
     uint64_t total_bytes = (uint64_t)stride * (height - 1) + (uint64_t)width * 4;
     void *host_ptr = hv_phys_ptr(fb->m, addr, total_bytes);
@@ -118,9 +118,14 @@ static int write_png_chunk(FILE *f, const char type[4], const uint8_t *data, uin
 }
 
 int hv_fb_save_png(HvFbDisplay *fb, const char *path) {
-    const uint8_t *px = NULL;
-    uint32_t w = 0, h = 0, stride = 0;
-    if (!path || hv_fb_display_get_frame(fb, &px, &w, &h, &stride) != 0) return -1;
+    if (!fb || !path) return -1;
+    pthread_mutex_lock(&fb->mu);
+    if (!fb->active || !fb->fb_host || !fb->width || !fb->height) {
+        pthread_mutex_unlock(&fb->mu);
+        return -1;
+    }
+    uint32_t w = fb->width, h = fb->height, stride = fb->stride;
+    const uint8_t *px = fb->fb_host;
 
     size_t row_bytes = 1 + (size_t)w * 3;
     size_t raw_size = row_bytes * h;
@@ -129,6 +134,7 @@ int hv_fb_save_png(HvFbDisplay *fb, const char *path) {
     uint8_t *raw = malloc(raw_size);
     uint8_t *idat = malloc(idat_size);
     if (!raw || !idat) {
+        pthread_mutex_unlock(&fb->mu);
         free(raw);
         free(idat);
         return -1;
@@ -150,6 +156,7 @@ int hv_fb_save_png(HvFbDisplay *fb, const char *path) {
             s2 = (s2 + s1) % 65521u;
         }
     }
+    pthread_mutex_unlock(&fb->mu);
 
     size_t pos = 0;
     idat[pos++] = 0x78; /* zlib CMF */

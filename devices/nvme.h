@@ -61,5 +61,6 @@ typedef struct HvNvme {
 } HvNvme;
 
 HvNvme *hv_nvme_create(HvMachine *m, HvPcie *bus, HvDisk *disk, const char *serial);
+void hv_nvme_destroy(HvNvme *nv);
 
 #endif

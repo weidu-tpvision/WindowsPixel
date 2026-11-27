@@ -35,6 +35,7 @@ typedef struct HvFwCfg {
 } HvFwCfg;
 
 HvFwCfg *hv_fw_cfg_create(HvMachine *m, uint64_t pa, uint16_t ncpus);
+void hv_fw_cfg_destroy(HvFwCfg *fc);
 /* Add a read-only named file (copies `data`). */
 int hv_fw_cfg_add_file(HvFwCfg *fc, const char *name, const void *data, uint32_t len);
 /* Add a guest-writable named file (e.g. "etc/ramfb") with a callback fired when DMA writes it. */

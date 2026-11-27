@@ -955,7 +955,9 @@ static void build_smbios(HvFwCfg *fw, int ncpus, uint64_t ram_size) {
 
     /* Type 17: Memory Device (len 40) */
     {
-        uint16_t mb = (uint16_t)(ram_size >> 20);
+        uint64_t total_mb = ram_size >> 20;
+        uint16_t mb = total_mb >= 0x7fffULL ? 0x7fffU : (uint16_t)total_mb;
+        uint32_t ext_mb = total_mb >= 0x7fffULL ? (uint32_t)(total_mb & 0x7fffffffULL) : 0U;
         b_u8(&t, 17);
         b_u8(&t, 40);
         b_u16(&t, 0x1100U);
@@ -976,13 +978,17 @@ static void build_smbios(HvFwCfg *fw, int ncpus, uint64_t ram_size) {
         b_u8(&t, 0);
         b_u8(&t, 0);
         b_u8(&t, 0);
-        b_u32(&t, 0);
+        b_u32(&t, ext_mb);
         b_u16(&t, 6400U);
         b_u16(&t, 1100U);
         b_u16(&t, 1100U);
         b_u16(&t, 1100U);
         b_put(&t, "LPDDR5X\0", 8);
+#ifdef __APPLE__
         b_put(&t, "Apple\0", 6);
+#else
+        b_put(&t, "JEDEC\0", 6);
+#endif
         b_u8(&t, 0);
     }
 

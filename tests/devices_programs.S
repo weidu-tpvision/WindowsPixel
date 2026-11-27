@@ -1,4 +1,4 @@
-// Guest programs for the device tests (JIT only, EL1, MMU off, on the vmapple map).
+// Guest programs for the device tests (JIT only, EL1, MMU off, on the HvWinVirt map).
 #include "harness.h"
 
     .arch armv8.4-a
@@ -44,10 +44,10 @@ PROGRAM p_timer_irq
     mov x20, #0
     mov x21, #0
     mov x23, #0
-    movz x0, #0x1000, lsl #16       // GICD
+    movz x0, #0x0800, lsl #16       // GICD (WINVIRT_GIC_DIST_PA)
     mov w2, #3
     str w2, [x0]                    // GICD_CTLR: EnableGrp0, EnableGrp1
-    movz x1, #0x1001, lsl #16       // GICR RD_base
+    movz x1, #0x080a, lsl #16       // GICR RD_base (WINVIRT_GIC_REDIST_PA)
     str wzr, [x1, #0x14]            // GICR_WAKER: wake up
 1:  ldr w2, [x1, #0x14]
     tbnz w2, #2, 1b                 // wait for ChildrenAsleep to clear
@@ -79,7 +79,7 @@ PROGRAM p_timer_irq
 END p_timer_irq
 
 PROGRAM p_uart
-    movz x0, #0x2001, lsl #16       // PL011
+    movz x0, #0x0900, lsl #16       // PL011 (WINVIRT_UART_PA)
     adr x1, uart_msg
 1:  ldrb w2, [x1], #1
     cbz w2, 2f

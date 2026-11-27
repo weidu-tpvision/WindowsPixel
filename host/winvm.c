@@ -105,12 +105,15 @@ static void on_ill(int sig, siginfo_t *info, void *ctx) {
 }
 #endif
 
-static void prepare_cpu_thread(void) {
+static void prepare_cpu_thread(int cpu_idx) {
+    static _Alignas(16) uint8_t altstacks[HV_MAX_CPUS][1u << 16];
     static __thread int done;
     if (done) return;
     done = 1;
-    stack_t ss = {.ss_sp = malloc(1u << 16), .ss_size = 1u << 16, .ss_flags = 0};
-    if (ss.ss_sp) sigaltstack(&ss, NULL);
+    if (cpu_idx >= 0 && cpu_idx < HV_MAX_CPUS) {
+        stack_t ss = {.ss_sp = altstacks[cpu_idx], .ss_size = sizeof altstacks[0], .ss_flags = 0};
+        sigaltstack(&ss, NULL);
+    }
     sigset_t set;
     sigfillset(&set);
     sigdelset(&set, SIGSEGV);
@@ -163,32 +166,92 @@ void hv_winvm_set_display_layer(void *layer) {
 #endif
 }
 
+static void display_lock_acquire(void) {
+#ifdef __APPLE__
+    os_unfair_lock_lock(&display_lock);
+#else
+    pthread_mutex_lock(&display_lock);
+#endif
+}
+
+static void display_lock_release(void) {
+#ifdef __APPLE__
+    os_unfair_lock_unlock(&display_lock);
+#else
+    pthread_mutex_unlock(&display_lock);
+#endif
+}
+
 int hv_winvm_display_size(uint32_t *w, uint32_t *h) {
+    display_lock_acquire();
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
-    if (!fb) return -1;
     const uint8_t *px = NULL;
     uint32_t fw = 0, fh = 0, st = 0;
-    if (hv_fb_display_get_frame(fb, &px, &fw, &fh, &st) != 0) return -1;
+    int rc = fb ? hv_fb_display_get_frame(fb, &px, &fw, &fh, &st) : -1;
+    display_lock_release();
+    if (rc != 0) return -1;
     if (w) *w = fw;
     if (h) *h = fh;
     return 0;
 }
 
+int hv_winvm_copy_frame_bgrx(uint8_t **buf, size_t *cap, uint32_t *w, uint32_t *h) {
+    if (!buf || !cap || !w || !h) return -1;
+    display_lock_acquire();
+    HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
+    if (!fb) {
+        display_lock_release();
+        return -1;
+    }
+    pthread_mutex_lock(&fb->mu);
+    if (!fb->active || !fb->fb_host || !fb->width || !fb->height) {
+        pthread_mutex_unlock(&fb->mu);
+        display_lock_release();
+        return -1;
+    }
+    uint32_t fw = fb->width, fh = fb->height, st = fb->stride;
+    size_t need = (size_t)fw * fh * 4;
+    if (*cap < need) {
+        uint8_t *nb = realloc(*buf, need);
+        if (!nb) {
+            pthread_mutex_unlock(&fb->mu);
+            display_lock_release();
+            return -1;
+        }
+        *buf = nb;
+        *cap = need;
+    }
+    for (uint32_t y = 0; y < fh; y++) {
+        memcpy(*buf + (size_t)y * fw * 4, fb->fb_host + (size_t)y * st, (size_t)fw * 4);
+    }
+    pthread_mutex_unlock(&fb->mu);
+    display_lock_release();
+    *w = fw;
+    *h = fh;
+    return 0;
+}
+
 uint64_t hv_winvm_display_frames(void) {
+    display_lock_acquire();
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
 #ifdef __APPLE__
-    return fb ? hv_fb_metal_frames(fb) : 0;
+    uint64_t n = fb ? hv_fb_metal_frames(fb) : 0;
 #elif defined(__ANDROID__)
     (void)fb;
-    return hv_fb_android_frames();
+    uint64_t n = hv_fb_android_frames();
 #else
-    return (fb && fb->active) ? 1 : 0;
+    uint64_t n = (fb && fb->active) ? 1 : 0;
 #endif
+    display_lock_release();
+    return n;
 }
 
 int hv_winvm_save_png(const char *path) {
+    display_lock_acquire();
     HvFbDisplay *fb = atomic_load_explicit(&display_fb, memory_order_acquire);
-    return fb ? hv_fb_save_png(fb, path) : -1;
+    int rc = fb ? hv_fb_save_png(fb, path) : -1;
+    display_lock_release();
+    return rc;
 }
 
 int hv_winvm_create(const HvWinVmConfig *c, char *err, size_t errlen) {
@@ -314,7 +377,7 @@ static void *kicker_thread(void *unused) {
 
 static void *secondary_thread(void *arg) {
     HvCpu *c = arg;
-    prepare_cpu_thread();
+    prepare_cpu_thread((int)c->index);
     int r = hv_run(c);
     if (!c->halted) {
         fprintf(stderr, "winvm: cpu %u stopped (%s) at pc=%llx el=%u\n",
@@ -352,7 +415,7 @@ void hv_winvm_flush_disks(void) {
 }
 
 int hv_winvm_run_cpu0(void) {
-    prepare_cpu_thread();
+    prepare_cpu_thread(0);
     for (;;) {
         int r = hv_run(&cpus[0]);
         hv_winvm_flush_disks();
@@ -448,7 +511,9 @@ void hv_winvm_destroy(void) {
         pthread_join(kicker_tid, NULL);
         kicker_started = 0;
     }
+    display_lock_acquire();
     atomic_store_explicit(&display_fb, NULL, memory_order_release);
+    display_lock_release();
     if (net_on) {
         hv_net_detach();
         net_on = 0;

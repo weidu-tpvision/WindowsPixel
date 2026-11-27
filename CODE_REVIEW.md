@@ -179,14 +179,20 @@ The render thread took `g_win`, unlocked, and only set `g_surface_bound = 1` onc
 
 ---
 
-## Open Items (Not Changed)
+## Second-Pass Review & Hardening (2026-11-27)
 
-1. **Manifest:** add `foregroundServiceType="specialUse|microphone"` with `FOREGROUND_SERVICE_MICROPHONE`, so the guest mic works while the app is in the background. Request `POST_NOTIFICATIONS` at runtime on API 33+.
-2. **AAudio stream opening** happens on a vCPU thread inside the HDA MMIO handler (tens of ms or more). Move it to a worker thread.
-3. **ramfb:** reject formats other than `XR24`/`XRGB8888`, or require `stride >= width*4`, since every consumer assumes 32 bpp.
-4. **`tests/test_devices.c`:** stale upstream test. Delete it or port it to `HvWinVirt`.
-5. **Prefault thread:** with `HV_RAM_FILE` set, a board-creation failure after the RAM mmap can `munmap` while the detached prefault thread is still touching pages. Only reachable through that environment variable.
-6. **Intermittent page-fault livelock** (the freeze): diagnosed but not yet fixed. See *Freeze Investigation* below.
+All 6 items from the initial "Open Items" list plus additional cross-platform bugs uncovered during the full-repo audit have now been resolved:
+
+1. **`.hvsparse` protection & Android unpack UI (`C1`):** `hv_disk_open()` now rejects `"HVSPARSE"` stream headers so packed archives can never be mounted raw or corrupted; `MainActivity.kt` + `winvm_jni.c` unpack `.hvsparse` to `windows11.img` with a progress bar before booting, flush deferred guest disk writes in `onStop()`, and retry `EINTR` across `disk.c` and `hvsparse.c`.
+2. **Android 15/16 16 KB page alignment & ART signal safety (`C2`, `C3`):** Added `-Wl,-z,max-page-size=16384` and `-fno-sanitize=shadow-call-stack` across all Android build targets (`0x4000` `PT_LOAD` alignment verified via `readelf -l`), rounded `hv_jit_region_open()` to `sysconf(_SC_PAGESIZE)`, and guarded `SIGSEGV`/`SIGBUS`/`SIGILL` installation behind `#ifndef __ANDROID__` + `sig_handlers_installed` so ART's `libsigchain` and `debuggerd` stay intact.
+3. **Async AAudio worker & Android 14+ permissions/input (`M5`–`M7`, Open Items #1 & #2):** Moved blocking `AAudioStreamBuilder_openStream()` and stream reopen onto a dedicated joinable worker thread (`host/audio_android.c`), added `FOREGROUND_SERVICE_MICROPHONE` + permission-gated `FOREGROUND_SERVICE_TYPE_MICROPHONE`, requested `POST_NOTIFICATIONS` on API 33+, passed volume keys through to Android, and expanded hardware keyboard HID mappings.
+4. **Dual-map JIT cache coherency, SMP `TLBI` synchronization & `PMCCNTR_EL0` (`H1`, `H2`, Open Item #6):** `hv_jit_finish()` now cleans the dirty `rw` `memfd` alias before invalidating `rx`; `hv_tlbi_drop_remote_va()` checks low-56-bit tag matches (avoiding false conflict evictions on remote vCPUs) and returns `-1` when a target vCPU holds `va` in its live TLB or active IJC so `hv_cpu_post_tlbi` + `hv_cpu_sync` retires any in-flight inline TLB access before `TLBI ... IS` completes; inline `PMCCNTR_EL0` now subtracts `hv_cnt_base`.
+5. **Lifecycle memory/FD leaks, framebuffer safety, SMBIOS & `test_devices` (`H3`, `H4`, `M1`–`M4`, `M8`, Open Items #3–#5):** Freed `HvRam.whint` (~75 MB on Linux / ~37 MB on Android per VM stop/start), `HvNvme.io_buf`, `HvFwCfg` files/directory, `HvHda` rings, `HvVirtioSnd` ring, and `prepare_cpu_thread` `sigaltstack`; made `prefault_thread` and SLIRP IPv6 loopback bridges joinable on teardown; initialized `wake_pipe = {-1, -1}`; serialized HTTP/VNC/PNG framebuffer snapshots via `hv_winvm_copy_frame_bgrx()` and enforced `stride >= width * 4` in `ramfb`; switched `share.c` clipboard wait to `CLOCK_MONOTONIC` + `MSG_NOSIGNAL`; added SMBIOS Type 17 `Extended Size` (`>= 32 GB` RAM); and ported `tests/test_devices.c` to `HvWinVirt` as part of `make test-core`.
+
+### Remaining Hardware Validation & Future Optimization
+- **Physical Pixel 9 run:** Verify cold `.hvsparse` unpack, UEFI $\to$ Windows 11 desktop boot, GLES 120 Hz touch/IME input, and AAudio speaker/mic on device.
+- **DGX Spark stress verification:** Re-run `./scripts/trace_freeze.sh run` under multi-tab Edge memory pressure to confirm the SMP `TLBI` fix eliminates the fault livelock in long sessions.
+- **Performance:** Move NVMe `pread`/`pwrite`/`fsync` off vCPU threads (`dev_mu`) and shard or reduce `tr_mu` contention.
 
 ---
 

@@ -54,7 +54,7 @@ static Slirp *slirp;
 static HvVirtioNet *net;
 static HvMachine *machine;
 static Queue to_guest, to_host;
-static int wake_pipe[2];
+static int wake_pipe[2] = {-1, -1};
 static Timer timers[MAX_TIMERS];
 static struct pollfd pfds[MAX_POLL];
 static int npfd;
@@ -73,6 +73,9 @@ static FwdReq pending_fwds[32];
 static int npending_fwds;
 static int active_fwds[64];
 static int nactive_fwds;
+static int v6_bridge_fds[64];
+static pthread_t v6_bridge_tids[64];
+static int nv6_bridges;
 
 typedef struct V6ConnPair {
     int a, b;
@@ -113,7 +116,17 @@ typedef struct V6AcceptArg {
 static void *v6_accept_thread(void *arg) {
     V6AcceptArg a = *(V6AcceptArg *)arg;
     free(arg);
-    for (;;) {
+    while (!atomic_load_explicit(&net_stop, memory_order_relaxed)) {
+        struct pollfd pfd = {a.listen_fd, POLLIN, 0};
+        int pr = poll(&pfd, 1, 100);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0 || !(pfd.revents & POLLIN)) {
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+            continue;
+        }
         int cfd = accept(a.listen_fd, NULL, NULL);
         if (cfd < 0) {
             if (errno == EINTR) continue;
@@ -161,8 +174,21 @@ static void start_ipv6_loopback_bridge(int port) {
     a->listen_fd = lfd;
     a->port = port;
     pthread_t t;
-    if (pthread_create(&t, NULL, v6_accept_thread, a) == 0) pthread_detach(t);
-    else { free(a); close(lfd); }
+    if (pthread_create(&t, NULL, v6_accept_thread, a) == 0) {
+        pthread_mutex_lock(&fwd_mu);
+        if (nv6_bridges < 64) {
+            v6_bridge_fds[nv6_bridges] = lfd;
+            v6_bridge_tids[nv6_bridges] = t;
+            nv6_bridges++;
+            pthread_mutex_unlock(&fwd_mu);
+        } else {
+            pthread_mutex_unlock(&fwd_mu);
+            pthread_detach(t);
+        }
+    } else {
+        free(a);
+        close(lfd);
+    }
 }
 
 void hv_net_add_hostfwd(int host_port, int guest_port) {
@@ -443,7 +469,12 @@ int hv_net_attach(HvMachine *m, HvVirtioNet *n) {
     cfg.if_mtu = 1500;
     cfg.if_mru = 1500;
     slirp = slirp_new(&cfg, &callbacks, NULL);
-    if (!slirp) return -1;
+    if (!slirp) {
+        close(wake_pipe[0]);
+        close(wake_pipe[1]);
+        wake_pipe[0] = wake_pipe[1] = -1;
+        return -1;
+    }
     if (getenv("HV_NET_FWD")) { /* debugging: "hostport:guestport", from this Mac's loopback into the guest */
         int hp, gp;
         struct in_addr h, g;
@@ -475,12 +506,26 @@ static void drain_queue(Queue *q) {
 }
 
 void hv_net_detach(void) {
+    atomic_store(&net_stop, 1);
     if (net_running) {
-        atomic_store(&net_stop, 1);
         char c = 0;
         if (wake_pipe[1] >= 0) (void)!write(wake_pipe[1], &c, 1);
         pthread_join(net_tid, NULL);
         net_running = 0;
+    }
+    pthread_mutex_lock(&fwd_mu);
+    int nb = nv6_bridges;
+    pthread_t btids[64];
+    for (int i = 0; i < nb; i++) {
+        if (v6_bridge_fds[i] >= 0) shutdown(v6_bridge_fds[i], SHUT_RDWR);
+        btids[i] = v6_bridge_tids[i];
+    }
+    nv6_bridges = 0;
+    npending_fwds = 0;
+    nactive_fwds = 0;
+    pthread_mutex_unlock(&fwd_mu);
+    for (int i = 0; i < nb; i++) {
+        pthread_join(btids[i], NULL);
     }
     if (slirp) {
         slirp_cleanup(slirp);
@@ -490,10 +535,6 @@ void hv_net_detach(void) {
     if (wake_pipe[1] >= 0) { close(wake_pipe[1]); wake_pipe[1] = -1; }
     drain_queue(&to_guest);
     drain_queue(&to_host);
-    pthread_mutex_lock(&fwd_mu);
-    npending_fwds = 0;
-    nactive_fwds = 0;
-    pthread_mutex_unlock(&fwd_mu);
     net = NULL;
     machine = NULL;
 }

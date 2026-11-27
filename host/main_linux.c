@@ -389,37 +389,31 @@ static void handle_web_client(int fd) {
         send_bytes(fd, hdr, (size_t)hl);
         send_bytes(fd, kWebIndexHtml, body_len);
     } else if (!strncmp(req, "GET /frame.rgba", 15)) {
-        HvWinVirt *board = hv_winvm_board();
-        const uint8_t *px = NULL;
-        uint32_t w = 0, h = 0, st = 0;
-        if (!board || !board->fb || hv_fb_display_get_frame(board->fb, &px, &w, &h, &st) != 0) {
+        uint8_t *rgba = NULL;
+        size_t cap = 0;
+        uint32_t w = 0, h = 0;
+        if (hv_winvm_copy_frame_bgrx(&rgba, &cap, &w, &h) != 0) {
             const char *resp = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
             send_bytes(fd, resp, strlen(resp));
         } else {
-            size_t total = (size_t)w * h * 4;
-            uint8_t *rgba = malloc(total);
-            if (rgba) {
-                for (uint32_t y = 0; y < h; y++) {
-                    const uint8_t *src = px + (size_t)y * st;
-                    uint8_t *dst = rgba + (size_t)y * w * 4;
-                    for (uint32_t x = 0; x < w; x++) {
-                        dst[x * 4 + 0] = src[x * 4 + 2]; /* R */
-                        dst[x * 4 + 1] = src[x * 4 + 1]; /* G */
-                        dst[x * 4 + 2] = src[x * 4 + 0]; /* B */
-                        dst[x * 4 + 3] = 255;            /* A */
-                    }
-                }
-                char hdr[256];
-                int hl = snprintf(hdr, sizeof hdr,
-                                  "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
-                                  "X-Width: %u\r\nX-Height: %u\r\n"
-                                  "Content-Length: %zu\r\nConnection: close\r\n\r\n",
-                                  w, h, total);
-                send_bytes(fd, hdr, (size_t)hl);
-                send_bytes(fd, rgba, total);
-                free(rgba);
+            size_t npx = (size_t)w * h;
+            for (size_t i = 0; i < npx; i++) {
+                uint8_t b = rgba[i * 4 + 0];
+                rgba[i * 4 + 0] = rgba[i * 4 + 2]; /* R */
+                rgba[i * 4 + 2] = b;               /* B */
+                rgba[i * 4 + 3] = 255;             /* A */
             }
+            size_t total = npx * 4;
+            char hdr[256];
+            int hl = snprintf(hdr, sizeof hdr,
+                              "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                              "X-Width: %u\r\nX-Height: %u\r\n"
+                              "Content-Length: %zu\r\nConnection: close\r\n\r\n",
+                              w, h, total);
+            send_bytes(fd, hdr, (size_t)hl);
+            send_bytes(fd, rgba, total);
         }
+        free(rgba);
     } else if (!strncmp(req, "POST /input?", 12)) {
         const char *q = req + 12;
         double x = 0, y = 0;
@@ -568,6 +562,8 @@ static uint64_t now_ms(void) {
 static void *vnc_client_thread(void *arg) {
     int fd = (int)(intptr_t)arg;
     uint8_t *rowbuf = NULL;
+    uint8_t *framebuf = NULL;
+    size_t framecap = 0;
     char ver[12];
     set_sock_timeouts(fd, 30); /* handshake; relaxed below once the session is up */
     if (send_bytes(fd, "RFB 003.008\n", 12) != 0 || recv_exact(fd, ver, 12) != 0) goto out;
@@ -645,10 +641,9 @@ static void *vnc_client_thread(void *arg) {
                 uint64_t now = now_ms();
                 if (now - last_frame_ms < 33) usleep((useconds_t)(33 - (now - last_frame_ms)) * 1000u);
             }
-            HvWinVirt *board = hv_winvm_board();
-            const uint8_t *px = NULL;
-            uint32_t fw = 0, fh = 0, st = 0;
-            if (!board || !board->fb || hv_fb_display_get_frame(board->fb, &px, &fw, &fh, &st) != 0) px = NULL;
+            uint32_t fw = 0, fh = 0;
+            const uint8_t *px = hv_winvm_copy_frame_bgrx(&framebuf, &framecap, &fw, &fh) == 0 ? framebuf : NULL;
+            uint32_t st = fw * 4;
             if (px && supports_desktop_size && (fw != cli_w || fh != cli_h) && fw <= 4096 && fh <= 4096) {
                 cli_w = fw;
                 cli_h = fh;
@@ -723,6 +718,7 @@ static void *vnc_client_thread(void *arg) {
         }
     }
 out:
+    free(framebuf);
     free(rowbuf);
     close(fd);
     return NULL;
@@ -750,7 +746,7 @@ static void *vnc_server_thread(void *arg) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s --code <code.fd> --vars <vars.fd> [options]\n"
-            "  --disk <img|hvsparse>     Primary NVMe disk image (read/write)\n"
+            "  --disk <raw.img>          Primary NVMe raw disk image (unpack .hvsparse first)\n"
             "  --disk1 <img|dmg>         Secondary/installer NVMe image (read-only)\n"
             "  --cpus <N>                Number of vCPUs (default: 4)\n"
             "  --ram <MB>                Guest RAM in MB (default: 4096)\n"
@@ -875,6 +871,6 @@ int main(int argc, char **argv) {
         int rc = hv_winvm_save_png(targs.screenshot_path);
         fprintf(stderr, "winvm: saved screenshot %s (rc=%d)\n", targs.screenshot_path, rc);
     }
-    hv_winvm_flush_disks();
+    hv_winvm_destroy();
     return 0;
 }

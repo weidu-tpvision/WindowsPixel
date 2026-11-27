@@ -83,9 +83,11 @@ static int init_rest(HvMachine *m) {
     pthread_mutexattr_init(&ra);
     pthread_mutexattr_settype(&ra, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&m->dev_mu, &ra);
+    pthread_mutexattr_destroy(&ra);
     pthread_mutex_init(&m->tr_mu, NULL);
     pthread_mutex_init(&m->stw_mu, NULL);
     pthread_cond_init(&m->stw_cv, NULL);
+    m->locks_inited = 1;
     for (int i = 0; i < HV_MAX_CPUS; i++) { /* untouched pages cost nothing, so every CPU gets its tables now */
         HvPerCpu *p = &m->percpu[i];
         p->ijc = calloc(HV_IJC_TABLES * HV_IJC_TABLE_BYTES / 8, 8);
@@ -109,6 +111,7 @@ static int init_rest(HvMachine *m) {
         pthread_condattr_destroy(&ca);
 #endif
         pthread_mutex_init(&p->req_mu, NULL);
+        p->locks_inited = 1;
     }
     return 0;
 }
@@ -270,16 +273,34 @@ void hv_machine_free(HvMachine *m) {
     for (int i = 0; i < m->nram; i++) {
         free(m->ram[i].code_pages);
         free(m->ram[i].page_gen);
+        free(m->ram[i].whint);
     }
     free(m->blocks);
+    free(m->prof);
     for (int i = 0; i < HV_MAX_CPUS; i++) {
-        free(m->percpu[i].ijc);
-        free(m->percpu[i].ucode);
-        free(m->percpu[i].cid_chunks);
+        HvPerCpu *p = &m->percpu[i];
+        free(p->ijc);
+        free(p->ucode);
+        free(p->cid_chunks);
         for (int k = 0; k < HV_STASHES; k++) {
-            free(m->percpu[i].stash[k].slot);
-            free(m->percpu[i].stash[k].ent);
+            free(p->stash[k].slot);
+            free(p->stash[k].ent);
         }
+        if (p->locks_inited) {
+            pthread_mutex_destroy(&p->wake_mu);
+            pthread_cond_destroy(&p->wake_cv);
+            pthread_mutex_destroy(&p->req_mu);
+            p->locks_inited = 0;
+        }
+    }
+    if (m->locks_inited) {
+        pthread_mutex_destroy(&m->dev_mu);
+        pthread_mutex_destroy(&m->tr_mu);
+        pthread_mutex_destroy(&m->stw_mu);
+        pthread_cond_destroy(&m->stw_cv);
+        pthread_mutex_destroy(&m->big_mu);
+        pthread_cond_destroy(&m->big_cv);
+        m->locks_inited = 0;
     }
     free(m->slots);
     free(m->slot_site);

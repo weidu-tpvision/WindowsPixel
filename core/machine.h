@@ -191,6 +191,7 @@ typedef struct HvPerCpu {
     uint64_t large_2m_bloom[64];
     uint64_t large_big_bloom[8];
     uint64_t last_refill_key;
+    int locks_inited;
 } HvPerCpu;
 
 #define HV_REQ_TLB_ALL 1u   /* drop the whole TLB and branch cache */
@@ -266,6 +267,7 @@ typedef struct HvMachine {
     /* --profile: host PCs of the CPU thread sampled every millisecond, drained by the stats line. */
     uint64_t *prof;
     uint32_t prof_head, prof_tail;
+    int locks_inited;
 } HvMachine;
 
 static inline uint32_t hv_block_hash(uint64_t va, uint64_t pa, uint32_t flags) {

@@ -231,10 +231,9 @@ adb push work/code.fd work/vars.fd work/windows11.hvsparse /sdcard/Android/data/
 | iOS / macOS (upstream WindowsiOS paths) | Kept intact behind `__APPLE__`; not rebuilt in this fork |
 
 **Next up**
-- Validate boot, display, input and audio on a physical Pixel 9.
-- Find and fix an intermittent page-fault livelock seen under heavy guest memory pressure. The built-in `FAULT LOOP` diagnostics capture its state.
+- Validate boot, display, input, `.hvsparse` first-boot unpacking, and AAudio duplex audio on a physical Pixel 9 (16 KB ELF alignment, ART signal chain safety, async AAudio worker, and foreground microphone/notification permissions are now in place).
+- Re-run stress testing (`./scripts/trace_freeze.sh run`) on DGX Spark to confirm the SMP `hv_tlbi_drop_remote_va()` synchronization and dual-map JIT `rw` cache-clean fixes eliminate the intermittent page-fault livelock under heavy memory pressure.
 - Move NVMe I/O off the vCPU threads, and reduce translation-lock contention for multi-process workloads.
-- Android polish: microphone foreground-service type, runtime notification permission, opening audio streams off the vCPU thread.
 
 ---
 
